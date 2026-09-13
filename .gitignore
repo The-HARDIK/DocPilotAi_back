@@ -1,0 +1,38 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment variables & secrets
+.env
+.env.*
+!.env.example
+
+# Databases & local storage
+docpilot.db
+chroma_db/
+test_chroma_db/
+uploaded_docs/
+*.pdf
+
+# Node / JS legacy placeholder files
+node_modules/
+package-lock.json
+package.json
+src/
+prisma/
+
+# IDEs & System files
+.vscode/
+.idea/
+.DS_Store
+*.log
+.agents/
+.claude/
