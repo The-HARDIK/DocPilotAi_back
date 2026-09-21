@@ -41,8 +41,8 @@ class DocPilotEngine:
         self.doc_registry: Dict[str, Dict[str, Any]] = {}
         self.raw_documents_map: Dict[str, List[Any]] = {}
         
-        # High-speed local ONNX embeddings (Instantaneous indexing, 0 rate limits, ~80MB RAM)
-        self.embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+        # High-speed local ONNX embeddings (Instantaneous indexing, 0 rate limits, ~50MB RAM)
+        self.embeddings = FastEmbedEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
         
         try:
             self.vector_store = Chroma(
@@ -67,7 +67,8 @@ class DocPilotEngine:
                 persist_directory=self.persist_directory
             )
 
-        self.default_model = "models/gemini-3.6-flash"
+        self.default_model = "models/gemini-3.5-flash"
+        self.fallback_model = "models/gemini-flash-lite-latest"
 
     def _get_llm(self, model: Optional[str] = None, max_tokens: Optional[int] = 4096) -> ChatGoogleGenerativeAI:
         chosen_model = model or self.default_model
@@ -80,19 +81,25 @@ class DocPilotEngine:
         )
 
     def _invoke_llm_with_retry(self, llm: ChatGoogleGenerativeAI, prompt_or_messages: Any, max_retries: int = 3) -> str:
-        """Invokes Gemini LLM with automatic rate-limit backoff."""
+        """Invokes Gemini LLM with automatic rate-limit backoff and resilient fallback."""
+        current_llm = llm
         for attempt in range(max_retries):
             try:
-                resp = llm.invoke(prompt_or_messages)
+                resp = current_llm.invoke(prompt_or_messages)
                 return _extract_text(resp.content)
             except Exception as e:
                 err_str = str(e)
-                if ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str) and attempt < max_retries - 1:
-                    delay = 15.0
+                if ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "404" in err_str):
+                    # Try falling back to high-capacity gemini-flash-lite-latest
+                    if current_llm.model != self.fallback_model:
+                        print(f"[DocPilot] Model {current_llm.model} limit reached or unavailable. Switching to fallback: {self.fallback_model}")
+                        current_llm = self._get_llm(model=self.fallback_model, max_tokens=current_llm.max_output_tokens)
+                        continue
+                    delay = 10.0
                     match = re.search(r"retry in ([\d\.]+)s", err_str)
                     if match:
                         delay = float(match.group(1)) + 1.5
-                    print(f"[DocPilot] Gemini chat rate limit reached. Waiting {delay:.1f}s before retry (attempt {attempt + 1}/{max_retries})...")
+                    print(f"[DocPilot] Gemini rate limit reached. Waiting {delay:.1f}s before retry (attempt {attempt + 1}/{max_retries})...")
                     time.sleep(delay)
                 else:
                     raise e
@@ -262,7 +269,7 @@ class DocPilotEngine:
         if chat_history and len(chat_history) > 0:
             search_query = self._contextualize_query(cleaned_question, chat_history, selected_model)
 
-        retrieved_results = self.vector_store.similarity_search_with_relevance_scores(
+        retrieved_results = self.vector_store.similarity_search_with_score(
             search_query, 
             k=min(top_k, collection_count)
         )
@@ -274,12 +281,14 @@ class DocPilotEngine:
             page_num = doc.metadata.get("page", 0) + 1
             doc_name = doc.metadata.get("doc_name") or os.path.basename(doc.metadata.get("source", "Document"))
             content = doc.page_content.strip()
+            # Normalize distance score to a 0.0 - 1.0 confidence value
+            norm_score = round(max(0.0, min(1.0, 1.0 / (1.0 + float(score)))), 3) if score is not None else 0.0
             
             sources.append({
                 "chunk_id": i + 1,
                 "doc_name": doc_name,
                 "page": page_num,
-                "relevance_score": round(float(score), 3) if score is not None else 0.0,
+                "relevance_score": norm_score,
                 "snippet": content[:140]
             })
             
