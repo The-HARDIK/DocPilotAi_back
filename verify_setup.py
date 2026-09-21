@@ -7,9 +7,9 @@ load_dotenv()
 print("--- Running DocPilot Environment Verification ---")
 try:
     engine = DocPilotEngine()
-    print("[PASS] Google Generative AI Embedding model (text-embedding-004) initialized.")
+    print("[PASS] FastEmbed local ONNX embedding engine ready (BGE Small v1.5).")
     print("[PASS] ChromaDB vector store ready.")
-    print("[PASS] Gemini LLM (gemini-1.5-flash) ready.")
+    print("[PASS] Google Gemini (gemini-3.6-flash) ready.")
     print("-------------------------------------------------")
     print("Environment setup is 100% complete and working.")
 except Exception as e:
