@@ -318,7 +318,7 @@ class DocPilotEngine:
         )
 
         try:
-            llm = self._get_llm(model=selected_model, max_tokens=1500)
+            llm = self._get_llm(model=selected_model, max_tokens=4096)
             resp = llm.invoke(messages)
             answer = _extract_text(resp.content)
         except Exception as e:
@@ -396,7 +396,7 @@ class DocPilotEngine:
         )
 
         try:
-            llm_reduce = self._get_llm(model=selected_model, max_tokens=1800)
+            llm_reduce = self._get_llm(model=selected_model, max_tokens=4096)
             final_resp = llm_reduce.invoke(reduce_prompt)
             if progress_callback:
                 progress_callback(1.0, "Study Guide Ready!")
