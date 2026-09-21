@@ -21,6 +21,7 @@ chroma_db/
 test_chroma_db/
 uploaded_docs/
 *.pdf
+!default_docs/operating_systems_core_guide.pdf
 
 # Node / JS legacy placeholder files
 node_modules/

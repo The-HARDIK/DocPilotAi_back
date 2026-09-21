@@ -11,7 +11,11 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_chroma import Chroma
 
-load_dotenv()
+env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+if os.path.exists(env_path):
+    load_dotenv(env_path)
+else:
+    load_dotenv()
 
 def _extract_text(content: Any) -> str:
     """Extracts clean string text from Gemini response blocks."""
@@ -44,36 +48,98 @@ class DocPilotEngine:
         # High-speed local ONNX embeddings (Instantaneous indexing, 0 rate limits, ~50MB RAM)
         self.embeddings = FastEmbedEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
         
+        # ChromaDB Cloud or Local configuration
+        self.chroma_api_key = os.getenv("CHROMA_API_KEY")
+        self.chroma_tenant = os.getenv("CHROMA_TENANT")
+        self.chroma_database = os.getenv("CHROMA_DATABASE", "osproject")
+        self.chroma_collection = os.getenv("CHROMA_COLLECTION", "odpdf")
+        self.cloud_client = None
+
+        if self.chroma_api_key and self.chroma_tenant:
+            try:
+                import chromadb
+                self.cloud_client = chromadb.CloudClient(
+                    api_key=self.chroma_api_key,
+                    tenant=self.chroma_tenant,
+                    database=self.chroma_database
+                )
+                self.vector_store = Chroma(
+                    client=self.cloud_client,
+                    collection_name=self.chroma_collection,
+                    embedding_function=self.embeddings
+                )
+                print(f"[DocPilot] Connected to Chroma Cloud (Tenant: {self.chroma_tenant[:8]}..., Database: {self.chroma_database}, Collection: {self.chroma_collection}).")
+            except Exception as ce:
+                print(f"[DocPilot] Warning: Could not connect to Chroma Cloud ({ce}). Falling back to local ChromaDB.")
+                self.vector_store = self._init_local_chroma()
+        else:
+            self.vector_store = self._init_local_chroma()
+
+        self.default_model = "models/gemini-3.8-flash-latest"
+        self.fallback_model = "models/gemini-flash-lite-latest"
+        self._cached_study_guide: Dict[str, str] = {}
+
+    def _init_local_chroma(self) -> Chroma:
+        """Initializes a clean local Chroma vector store instance."""
         try:
-            self.vector_store = Chroma(
+            return Chroma(
                 collection_name=self.collection_name,
                 embedding_function=self.embeddings,
                 persist_directory=self.persist_directory
             )
-            # Verify if existing collection has compatible embedding dimensions
-            if self.vector_store._collection.count() > 0:
-                pass
         except Exception:
-            # Recreate vector store cleanly if dimension mismatch from previous embedding model
             try:
                 import shutil
                 if os.path.exists(self.persist_directory):
                     shutil.rmtree(self.persist_directory)
             except Exception:
                 pass
-            self.vector_store = Chroma(
+            return Chroma(
                 collection_name=self.collection_name,
                 embedding_function=self.embeddings,
                 persist_directory=self.persist_directory
             )
 
-        self.default_model = "models/gemini-3.5-flash"
-        self.fallback_model = "models/gemini-flash-lite-latest"
+    def ensure_default_os_knowledge(self) -> bool:
+        """Loads and indexes the core Operating Systems knowledge guide into ChromaDB if not already present."""
+        builtin_name = "Operating_Systems_Core_Guide.pdf"
+        if builtin_name in self.doc_registry:
+            return True
+
+        default_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "default_docs")
+        pdf_path = os.path.join(default_dir, "operating_systems_core_guide.pdf")
+
+        if not os.path.isfile(pdf_path):
+            try:
+                from default_docs.generate_os_reference import create_os_guide
+                create_os_guide(pdf_path)
+            except Exception as e:
+                print(f"[DocPilot] Could not generate OS guide PDF: {e}")
+                return False
+
+        if os.path.isfile(pdf_path):
+            try:
+                self.add_pdf(pdf_path, filename=builtin_name, is_builtin=True)
+                print(f"[DocPilot] Default OS knowledge base indexed successfully ({self.doc_registry[builtin_name]['chunks']} chunks).")
+                return True
+            except Exception as e:
+                print(f"[DocPilot] Error indexing default OS guide: {e}")
+                return False
+        return False
 
     def _get_llm(self, model: Optional[str] = None, max_tokens: Optional[int] = 4096) -> ChatGoogleGenerativeAI:
         chosen_model = model or self.default_model
         if not chosen_model.startswith("models/"):
             chosen_model = f"models/{chosen_model}" if "gemini" in chosen_model else self.default_model
+
+        # Map experimental or future aliases gracefully to active production endpoints
+        model_aliases = {
+            "models/gemini-3.8-flash-latest": "models/gemini-flash-latest",
+            "models/gemini-3.6-flash": "models/gemini-flash-lite-latest",
+            "models/gemini-3.5-flash": "models/gemini-flash-latest",
+        }
+        chosen_model = model_aliases.get(chosen_model, chosen_model)
+
         return ChatGoogleGenerativeAI(
             model=chosen_model,
             google_api_key=self.api_key,
@@ -89,17 +155,17 @@ class DocPilotEngine:
                 return _extract_text(resp.content)
             except Exception as e:
                 err_str = str(e)
-                if ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "404" in err_str):
+                if ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "404" in err_str or "503" in err_str or "UNAVAILABLE" in err_str or "high demand" in err_str.lower()):
                     # Try falling back to high-capacity gemini-flash-lite-latest
                     if current_llm.model != self.fallback_model:
-                        print(f"[DocPilot] Model {current_llm.model} limit reached or unavailable. Switching to fallback: {self.fallback_model}")
+                        print(f"[DocPilot] Model {current_llm.model} limit reached or unavailable ({err_str[:60]}). Switching to fallback: {self.fallback_model}")
                         current_llm = self._get_llm(model=self.fallback_model, max_tokens=current_llm.max_output_tokens)
                         continue
-                    delay = 10.0
+                    delay = 5.0
                     match = re.search(r"retry in ([\d\.]+)s", err_str)
                     if match:
                         delay = float(match.group(1)) + 1.5
-                    print(f"[DocPilot] Gemini rate limit reached. Waiting {delay:.1f}s before retry (attempt {attempt + 1}/{max_retries})...")
+                    print(f"[DocPilot] Gemini service busy. Waiting {delay:.1f}s before retry (attempt {attempt + 1}/{max_retries})...")
                     time.sleep(delay)
                 else:
                     raise e
@@ -117,17 +183,27 @@ class DocPilotEngine:
     def raw_documents(self, docs: List[Any]):
         self.raw_documents_map["default"] = docs
 
-    def get_documents(self) -> List[Dict[str, Any]]:
-        """Returns metadata for all currently indexed documents."""
+    def get_documents(self, include_builtin: bool = False) -> List[Dict[str, Any]]:
+        """Returns metadata for currently indexed documents (excluding built-in docs unless include_builtin is True)."""
         return [
             {
                 "filename": info["filename"],
                 "chunks": info["chunks"],
                 "pages": info["pages"],
-                "filepath": info["filepath"]
+                "filepath": info["filepath"],
+                "is_builtin": info.get("is_builtin", False)
             }
             for info in self.doc_registry.values()
+            if include_builtin or not info.get("is_builtin", False)
         ]
+
+    def has_builtin_knowledge(self) -> bool:
+        """Returns True if the default Operating Systems guide is indexed."""
+        return "Operating_Systems_Core_Guide.pdf" in self.doc_registry
+
+    def get_builtin_document(self) -> Optional[Dict[str, Any]]:
+        """Returns metadata for the default Operating Systems guide if indexed."""
+        return self.doc_registry.get("Operating_Systems_Core_Guide.pdf")
 
     def remove_pdf(self, filename: str) -> bool:
         """Removes an indexed PDF and its chunks from ChromaDB."""
@@ -148,32 +224,46 @@ class DocPilotEngine:
         del self.doc_registry[filename]
         if filename in self.raw_documents_map:
             del self.raw_documents_map[filename]
+        self._cached_study_guide.clear()
         return True
 
-    def clear_all(self):
-        """Removes all indexed documents and resets vector store."""
+    def clear_all(self, preserve_builtin: bool = True):
+        """Removes all indexed documents and resets vector store. Preserves default OS guide by default."""
         try:
             self.vector_store.delete_collection()
         except Exception:
             pass
 
-        self.vector_store = Chroma(
-            collection_name=self.collection_name,
-            embedding_function=self.embeddings,
-            persist_directory=self.persist_directory
-        )
+        if self.cloud_client:
+            try:
+                self.vector_store = Chroma(
+                    client=self.cloud_client,
+                    collection_name=self.chroma_collection,
+                    embedding_function=self.embeddings
+                )
+            except Exception:
+                self.vector_store = self._init_local_chroma()
+        else:
+            self.vector_store = self._init_local_chroma()
+
         self.doc_registry.clear()
         self.raw_documents_map.clear()
+        self._cached_study_guide.clear()
 
-    def add_pdf(self, pdf_path: str, filename: Optional[str] = None) -> int:
+        if preserve_builtin:
+            self.ensure_default_os_knowledge()
+
+    def add_pdf(self, pdf_path: str, filename: Optional[str] = None, is_builtin: bool = False) -> int:
         """Loads, chunks, and indexes a PDF document into ChromaDB in seconds."""
         if not os.path.isfile(pdf_path):
             raise FileNotFoundError(f"File not found: {pdf_path}")
 
         doc_name = filename or os.path.basename(pdf_path)
 
-        if doc_name not in self.doc_registry and len(self.doc_registry) >= self.MAX_DOCUMENTS:
-            raise ValueError(f"Maximum {self.MAX_DOCUMENTS} documents allowed. Please remove a document first.")
+        if not is_builtin:
+            user_doc_count = len([d for d in self.doc_registry.values() if not d.get("is_builtin", False)])
+            if doc_name not in self.doc_registry and user_doc_count >= self.MAX_DOCUMENTS:
+                raise ValueError(f"Maximum {self.MAX_DOCUMENTS} documents allowed. Please remove a document first.")
 
         # If already exists, replace cleanly
         if doc_name in self.doc_registry:
@@ -214,16 +304,18 @@ class DocPilotEngine:
             "filepath": pdf_path,
             "chunks": len(chunks),
             "pages": len(pages),
-            "chunk_ids": chunk_ids
+            "chunk_ids": chunk_ids,
+            "is_builtin": is_builtin
         }
         self.raw_documents_map[doc_name] = pages
+        self._cached_study_guide.clear()
 
         return len(chunks)
 
     def ingest_pdf(self, pdf_path: str, filename: Optional[str] = None, clear_existing: bool = False) -> int:
         """Loads and indexes a PDF document. If clear_existing is True, resets existing docs."""
         if clear_existing:
-            self.clear_all()
+            self.clear_all(preserve_builtin=True)
         return self.add_pdf(pdf_path, filename=filename)
 
     def _contextualize_query(self, question: str, chat_history: List[Dict[str, str]], model: str) -> str:
@@ -259,11 +351,36 @@ class DocPilotEngine:
         if not cleaned_question:
             return {"answer": "Please provide a valid question.", "sources": []}
 
-        collection_count = self.vector_store._collection.count()
-        if collection_count == 0:
-            return {"answer": "No documents are currently indexed.", "sources": []}
-
         selected_model = model or self.default_model
+        collection_count = self.vector_store._collection.count()
+
+        # If no documents exist in vector store, provide direct AI answer
+        if collection_count == 0:
+            direct_messages = [
+                SystemMessage(
+                    content=(
+                        "You are DocPilot AI, an expert academic tutor and technical assistant specializing in Operating Systems and computer science.\n"
+                        "Formatting Rules:\n"
+                        "1. Explain the concepts thoroughly, clearly, and step-by-step.\n"
+                        "2. TABLES: Format comparison matrices, process tables, and registers strictly as Markdown tables with header pipes.\n"
+                        "3. GANTT CHARTS & DIAGRAMS: Wrap execution flows, ASCII timelines, or queues in fenced code blocks (```text ... ```).\n"
+                        "4. MATH & FORMULAS: Present calculations step-by-step with clean arithmetic.\n"
+                    )
+                )
+            ]
+            if chat_history:
+                for turn in chat_history[-4:]:
+                    if turn.get("role") == "user":
+                        direct_messages.append(HumanMessage(content=turn.get("content", "")))
+                    else:
+                        direct_messages.append(AIMessage(content=turn.get("content", "")))
+            direct_messages.append(HumanMessage(content=cleaned_question))
+            try:
+                llm = self._get_llm(model=selected_model, max_tokens=4096)
+                answer = self._invoke_llm_with_retry(llm, direct_messages)
+            except Exception as e:
+                answer = f"Error communicating with Gemini AI: {str(e)}"
+            return {"answer": answer, "sources": [], "standalone_query": cleaned_question}
 
         search_query = cleaned_question
         if chat_history and len(chat_history) > 0:
@@ -299,15 +416,15 @@ class DocPilotEngine:
         messages = [
             SystemMessage(
                 content=(
-                    "You are DocPilot AI, an expert academic tutor and technical assistant.\n"
+                    "You are DocPilot AI, an expert academic tutor and technical assistant specializing in Operating Systems and computer science.\n"
                     "Formatting Rules:\n"
-                    "1. Explain the concepts thoroughly, clearly, and step-by-step using the provided context.\n"
-                    "2. TABLES: Whenever presenting structured data, process tables, comparison matrices, or registers, ALWAYS format them strictly as standard GitHub-flavored Markdown tables with header pipes (e.g. | Process | AT | BT | and |---|---|---|). NEVER output raw tabs or whitespace-separated columns.\n"
-                    "3. GANTT CHARTS & DIAGRAMS: Whenever illustrating Gantt charts, ASCII timelines, execution flows, or queue states (e.g. +---+---+ or [P1, P2]), ALWAYS wrap them inside fenced code blocks (```text ... ```) so spaces, alignment, and monospace formatting are preserved.\n"
-                    "4. MATH & FORMULAS: Present calculations cleanly. You may use standard LaTeX $...$ for inline math or $$...$$ for display formulas, or clean readable arithmetic (e.g. (9 + 7 + 3) / 3 = 19 / 3 = 6.33 ms).\n"
-                    "5. CITATIONS: Always cite specific Document names and Page numbers (e.g. [Document.pdf, Page X]).\n"
-                    "6. MISSING CONTEXT: If a specific detail or numerical value is absent from the text, state clearly what is missing rather than giving a generic refusal.\n"
-                    "7. MULTI-DOC: When information comes from different uploaded documents, synthesize or contrast them clearly."
+                    "1. Explain the concepts thoroughly, clearly, and step-by-step using the provided context whenever relevant.\n"
+                    "2. CITATIONS: When citing information from the context, cite specific Document names and Page numbers (e.g. [Operating_Systems_Core_Guide.pdf, Page X] or [UploadedDoc.pdf, Page X]).\n"
+                    "3. GENERAL & TECHNICAL QUESTIONS: If the question asks for explanations, comparisons, algorithms, or examples that go beyond the excerpted chunks, leverage your full academic technical expertise to provide a complete, rigorous, and accurate answer rather than refusing.\n"
+                    "4. TABLES: Whenever presenting structured data, process tables, comparison matrices, or registers, ALWAYS format them strictly as standard GitHub-flavored Markdown tables with header pipes (e.g. | Algorithm | Preemptive | Waiting Time |). NEVER output raw tabs or whitespace-separated columns.\n"
+                    "5. GANTT CHARTS & DIAGRAMS: Whenever illustrating Gantt charts, ASCII timelines, execution flows, or queue states (e.g. +---+---+ or [P1, P2]), ALWAYS wrap them inside fenced code blocks (```text ... ```) so spaces, alignment, and monospace formatting are preserved.\n"
+                    "6. MATH & FORMULAS: Present calculations cleanly with arithmetic steps.\n"
+                    "7. MULTI-DOC: When information comes from different loaded documents, synthesize or contrast them clearly."
                 )
             )
         ]
@@ -402,74 +519,65 @@ class DocPilotEngine:
             }
 
     def generate_study_guide(self, model: Optional[str] = None, progress_callback=None) -> str:
-        """Map-reduce summarization with dynamic model selection across documents."""
+        """Generates a comprehensive Master Study Guide using single-shot synthesis with caching to avoid rate limits."""
+        # Check cache first
+        cache_key = "_".join(sorted(self.doc_registry.keys())) or "default_os_guide"
+        if cache_key in self._cached_study_guide:
+            if progress_callback:
+                progress_callback(1.0, "Study Guide Ready (Loaded from Cache)!")
+            return self._cached_study_guide[cache_key]
+
+        # Ensure documents are available; if none, index default OS guide
         if not self.raw_documents:
-            raise ValueError("No documents are currently loaded. Please upload at least one PDF first.")
+            self.ensure_default_os_knowledge()
 
         selected_model = model or self.default_model
-        total_pages = len(self.raw_documents)
-        page_summaries = []
-
-        batch_size = 4
-        batches = [self.raw_documents[i:i + batch_size] for i in range(0, total_pages, batch_size)]
-
-        llm_map = self._get_llm(model=selected_model, max_tokens=400)
-
-        for idx, batch in enumerate(batches):
-            if progress_callback:
-                first_doc = batch[0].metadata.get("doc_name", "Doc")
-                first_page = batch[0].metadata.get("page", 0) + 1
-                last_page = batch[-1].metadata.get("page", 0) + 1
-                progress_callback(
-                    (idx + 1) / (len(batches) + 1),
-                    f"Analyzing {first_doc} (Pages {first_page} to {last_page})..."
-                )
-
-            batch_text = ""
-            for doc in batch:
-                p_num = doc.metadata.get("page", 0) + 1
-                d_name = doc.metadata.get("doc_name") or os.path.basename(doc.metadata.get("source", "Document"))
-                clean_text = doc.page_content.strip()[:1800]
-                batch_text += f"\n--- [{d_name}] Page {p_num} ---\n{clean_text}"
-
-            map_prompt = (
-                "Extract and summarize key technical concepts, registers, memory layouts, "
-                "hardware mechanics, or assembly instructions in concise bullet points with document name and page citations.\n\n"
-                f"{batch_text}\n\n"
-                "Technical Summary (max 200 words):"
-            )
-
-            try:
-                summary = self._invoke_llm_with_retry(llm_map, map_prompt)
-                page_summaries.append(summary.strip())
-            except Exception as e:
-                page_summaries.append(f"Section Summary: {str(e)}")
-
-            time.sleep(0.3)
 
         if progress_callback:
-            progress_callback(0.95, "Synthesizing master study guide...")
+            progress_callback(0.25, "Extracting core concepts and structure...")
 
-        combined_summaries = "\n\n".join(page_summaries)
-        if len(combined_summaries) > 10000:
-            combined_summaries = combined_summaries[:10000]
+        # Aggregate excerpted content across active documents (up to 18,000 chars for optimal single-shot context)
+        aggregated_snippets = []
+        doc_count = len(self.raw_documents_map)
 
-        reduce_prompt = (
-            "You are an expert academic professor. Using the following section summaries from the provided technical documents, "
-            "create a structured Master Study Guide synthesizing key concepts across all documents.\n\n"
-            "Format your guide cleanly in Markdown with standard tables:\n"
-            "# 📘 Comprehensive Study Guide & Exam Prep\n"
-            "## 1. Executive Overview\n"
-            "## 2. Core Technical Breakdown (with syntax, examples, and [Document, Page X] citations)\n"
-            "## 3. Key Registers & Memory Map Tables\n"
-            "## 4. High-Yield Exam Points\n\n"
-            f"Source Section Summaries:\n{combined_summaries}"
+        for doc_name, pages in self.raw_documents_map.items():
+            doc_text = ""
+            for p in pages:
+                p_num = p.metadata.get("page", 0) + 1
+                content = p.page_content.strip()
+                if content:
+                    doc_text += f"\n[{doc_name} Page {p_num}]:\n{content}\n"
+            # Cap per document to balance multi-doc representation
+            char_budget = 18000 // max(1, doc_count)
+            aggregated_snippets.append(doc_text[:char_budget])
+
+        source_material = "\n\n".join(aggregated_snippets)
+        if not source_material.strip():
+            source_material = "Core Operating Systems Principles: Processes, Threads, CPU Scheduling, Synchronization, Memory Management, Paging, Virtual Memory, and File Systems."
+
+        if progress_callback:
+            progress_callback(0.65, "Synthesizing master study guide...")
+
+        study_guide_prompt = (
+            "You are a distinguished university professor in Computer Science and Operating Systems.\n"
+            "Create a master study guide and comprehensive exam review based on the following material.\n\n"
+            "Format your guide cleanly in Markdown with tables:\n"
+            "# 📘 Master Study Guide & Exam Prep\n"
+            "## 1. Executive Summary & Foundational Principles\n"
+            "## 2. Core Technical Breakdown (with citations like [Document, Page X] when available)\n"
+            "## 3. High-Yield Comparison Tables (e.g., Scheduling Algorithms, Paging vs Segmentation, Mutex vs Semaphore)\n"
+            "## 4. Key Formulas, Numerical Solving Tips & Formulas (e.g., Turnaround Time, Waiting Time, Effective Access Time)\n"
+            "## 5. Must-Know Exam & Viva Review Questions\n\n"
+            f"Reference Material:\n{source_material}"
         )
 
         try:
-            llm_reduce = self._get_llm(model=selected_model, max_tokens=4096)
+            llm = self._get_llm(model=selected_model, max_tokens=4096)
+            guide = self._invoke_llm_with_retry(llm, study_guide_prompt)
             if progress_callback:
                 progress_callback(1.0, "Study Guide Ready!")
-            return self._invoke_llm_with_retry(llm_reduce, reduce_prompt)
+            if guide and not guide.startswith("Error"):
+                self._cached_study_guide[cache_key] = guide
+            return guide
         except Exception as e:
-            return f"Error synthesizing final study guide: {str(e)}"
+            return f"Error synthesizing study guide: {str(e)}"

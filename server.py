@@ -2,7 +2,7 @@ import os
 import shutil
 import json
 from typing import List, Optional
-from fastapi import FastAPI, UploadFile, File, Query, HTTPException, Depends, status
+from fastapi import FastAPI, UploadFile, File, Form, Query, HTTPException, Depends, status, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -10,7 +10,7 @@ from google.oauth2 import id_token
 from google.auth.transport import requests as grequests
 
 from rag_engine import DocPilotEngine
-from database import init_db, SessionLocal, User, Conversation, Message
+from database import init_db, SessionLocal, User, Conversation, Message, DocumentRecord
 
 # Initialize DB on startup
 init_db()
@@ -43,10 +43,32 @@ app.add_middleware(
 )
 
 engine = DocPilotEngine()
+# Auto-index built-in Operating Systems knowledge guide on startup
+engine.ensure_default_os_knowledge()
 
 # Dedicated storage folder for active documents
 UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploaded_docs")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# Synchronize custom documents stored in Neon PostgreSQL into active index on startup
+try:
+    _init_db_session = SessionLocal()
+    _stored_docs = _init_db_session.query(DocumentRecord).all()
+    for _doc in _stored_docs:
+        _cached_path = os.path.join(UPLOAD_DIR, _doc.filename)
+        if not os.path.exists(_cached_path) or os.path.getsize(_cached_path) == 0:
+            with open(_cached_path, "wb") as _f:
+                _f.write(_doc.file_data)
+        if _doc.filename not in engine.doc_registry:
+            try:
+                engine.add_pdf(_cached_path, filename=_doc.filename)
+            except Exception as _e:
+                print(f"[DocPilot] Note: could not index {_doc.filename} on startup: {_e}")
+    _init_db_session.close()
+    if _stored_docs:
+        print(f"[DocPilot] Restored {len(_stored_docs)} document(s) from Neon PostgreSQL into active index.")
+except Exception as _sync_err:
+    print(f"[DocPilot] Note on startup Neon document sync: {_sync_err}")
 
 # Tracks which document is currently active in the viewer
 selected_document: Optional[str] = None
@@ -80,21 +102,41 @@ class SaveMessageRequest(BaseModel):
 def get_current_selected_doc() -> Optional[str]:
     global selected_document
     docs = engine.get_documents()
-    if not docs:
-        selected_document = None
-        return None
     filenames = [d["filename"] for d in docs]
-    if selected_document not in filenames:
+    if selected_document and selected_document in filenames:
+        return selected_document
+    if filenames:
         selected_document = filenames[0]
-    return selected_document
+        return selected_document
+    if engine.has_builtin_knowledge():
+        return "Operating_Systems_Core_Guide.pdf"
+    selected_document = None
+    return None
+
+@app.get("/")
+def root():
+    return {
+        "service": "DocPilot AI API",
+        "status": "online",
+        "version": "1.0.0",
+        "docs": "/docs"
+    }
+
+@app.get("/health")
+def health_check():
+    return {"status": "healthy", "service": "docpilot-backend"}
 
 @app.get("/api/status")
 def get_status():
     docs = engine.get_documents()
     current_doc = get_current_selected_doc()
     total_chunks = sum(d["chunks"] for d in docs)
+    builtin_doc = engine.get_builtin_document()
     return {
         "status": "ready",
+        "has_builtin_knowledge": engine.has_builtin_knowledge(),
+        "builtin_title": "Operating Systems Core Guide",
+        "builtin_chunks": builtin_doc["chunks"] if builtin_doc else 0,
         "documents": docs,
         "active_document": current_doc,
         "total_documents": len(docs),
@@ -105,7 +147,8 @@ def get_status():
 @app.post("/api/upload")
 async def upload_documents(
     files: Optional[List[UploadFile]] = File(None),
-    file: Optional[UploadFile] = File(None)
+    file: Optional[UploadFile] = File(None),
+    user_id: Optional[str] = Form(None)
 ):
     global selected_document
     # Collect all provided files (supporting both single and multiple uploads)
@@ -133,18 +176,65 @@ async def upload_documents(
 
     uploaded_results = []
     for f in all_files:
+        content = await f.read()
+
+        # 1. Store directly in Neon PostgreSQL documents table
+        db = SessionLocal()
+        try:
+            doc_rec = db.query(DocumentRecord).filter(DocumentRecord.filename == f.filename).first()
+            if doc_rec:
+                doc_rec.file_data = content
+                doc_rec.file_size = len(content)
+                if user_id and user_id != "undefined":
+                    doc_rec.user_id = user_id
+            else:
+                doc_rec = DocumentRecord(
+                    filename=f.filename,
+                    user_id=user_id if user_id and user_id != "undefined" else None,
+                    file_data=content,
+                    file_size=len(content)
+                )
+                db.add(doc_rec)
+            db.commit()
+        except Exception as db_err:
+            db.rollback()
+            print(f"[DocPilot] Note: Error storing file in Neon: {db_err}")
+        finally:
+            db.close()
+
+        # 2. Stage locally for chunking with PyPDFLoader
         saved_path = os.path.join(UPLOAD_DIR, f.filename)
         with open(saved_path, "wb") as buffer:
-            shutil.copyfileobj(f.file, buffer)
+            buffer.write(content)
 
+        # 3. Add to Chroma vector database
         try:
             chunks = engine.add_pdf(saved_path, filename=f.filename)
             uploaded_results.append({"filename": f.filename, "chunks": chunks})
             if selected_document is None:
                 selected_document = f.filename
+
+            # Update chunk and page counts in Neon
+            db = SessionLocal()
+            try:
+                doc_rec = db.query(DocumentRecord).filter(DocumentRecord.filename == f.filename).first()
+                if doc_rec:
+                    doc_rec.chunk_count = chunks
+                    doc_info = engine.doc_registry.get(f.filename)
+                    if doc_info:
+                        doc_rec.page_count = doc_info.get("pages", 0)
+                    db.commit()
+            finally:
+                db.close()
         except Exception as e:
             if os.path.exists(saved_path):
                 os.remove(saved_path)
+            db = SessionLocal()
+            try:
+                db.query(DocumentRecord).filter(DocumentRecord.filename == f.filename).delete()
+                db.commit()
+            finally:
+                db.close()
             raise HTTPException(status_code=500, detail=f"Error indexing '{f.filename}': {str(e)}")
 
     docs = engine.get_documents()
@@ -159,30 +249,61 @@ async def upload_documents(
 
 @app.get("/api/document")
 def get_document(filename: Optional[str] = Query(None)):
-    """Serves an uploaded PDF directly for the split-screen viewer."""
+    """Serves an uploaded PDF or default OS guide for the split-screen viewer."""
     target_filename = filename or get_current_selected_doc()
     if not target_filename:
         raise HTTPException(status_code=404, detail="No active document found.")
 
-    file_path = os.path.join(UPLOAD_DIR, target_filename)
-    if not os.path.isfile(file_path):
-        raise HTTPException(status_code=404, detail=f"Document '{target_filename}' not found.")
+    if target_filename == "Operating_Systems_Core_Guide.pdf":
+        builtin_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "default_docs", "operating_systems_core_guide.pdf")
+        if os.path.isfile(builtin_path):
+            return FileResponse(
+                path=builtin_path,
+                media_type="application/pdf",
+                filename="Operating_Systems_Core_Guide.pdf",
+                headers={
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Expose-Headers": "Content-Disposition"
+                }
+            )
 
-    return FileResponse(
-        path=file_path, 
-        media_type="application/pdf",
-        filename=target_filename,
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Expose-Headers": "Content-Disposition"
-        }
-    )
+    # 1. Fetch directly from Neon PostgreSQL documents table
+    db = SessionLocal()
+    try:
+        doc_rec = db.query(DocumentRecord).filter(DocumentRecord.filename == target_filename).first()
+        if doc_rec and doc_rec.file_data:
+            return Response(
+                content=doc_rec.file_data,
+                media_type="application/pdf",
+                headers={
+                    "Content-Disposition": f'inline; filename="{target_filename}"',
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Expose-Headers": "Content-Disposition"
+                }
+            )
+    finally:
+        db.close()
+
+    # Fallback to local cached file if present
+    file_path = os.path.join(UPLOAD_DIR, target_filename)
+    if os.path.isfile(file_path):
+        return FileResponse(
+            path=file_path, 
+            media_type="application/pdf",
+            filename=target_filename,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Expose-Headers": "Content-Disposition"
+            }
+        )
+
+    raise HTTPException(status_code=404, detail=f"Document '{target_filename}' not found.")
 
 @app.post("/api/document/select")
 def select_active_document(payload: SelectDocRequest):
     global selected_document
     docs = {d["filename"] for d in engine.get_documents()}
-    if payload.filename not in docs:
+    if payload.filename != "Operating_Systems_Core_Guide.pdf" and payload.filename not in docs:
         raise HTTPException(status_code=404, detail=f"Document '{payload.filename}' not found in loaded documents.")
     selected_document = payload.filename
     return {"message": f"Active preview set to {selected_document}", "active_document": selected_document}
@@ -190,10 +311,18 @@ def select_active_document(payload: SelectDocRequest):
 @app.delete("/api/document/{filename}")
 def delete_document(filename: str):
     global selected_document
-    removed = engine.remove_pdf(filename)
-    if not removed:
-        raise HTTPException(status_code=404, detail=f"Document '{filename}' not found.")
+    # 1. Delete from Neon PostgreSQL
+    db = SessionLocal()
+    try:
+        db.query(DocumentRecord).filter(DocumentRecord.filename == filename).delete()
+        db.commit()
+    finally:
+        db.close()
 
+    # 2. Delete from ChromaDB
+    removed = engine.remove_pdf(filename)
+
+    # 3. Clean local cache
     file_path = os.path.join(UPLOAD_DIR, filename)
     if os.path.isfile(file_path):
         try:
@@ -216,17 +345,28 @@ def delete_document(filename: str):
 @app.delete("/api/documents/clear")
 def clear_all_documents():
     global selected_document
-    engine.clear_all()
+    # 1. Delete all custom documents from Neon PostgreSQL
+    db = SessionLocal()
+    try:
+        db.query(DocumentRecord).delete()
+        db.commit()
+    finally:
+        db.close()
+
+    # 2. Reset ChromaDB
+    engine.clear_all(preserve_builtin=True)
     selected_document = None
-    # Remove files in UPLOAD_DIR
-    for fname in os.listdir(UPLOAD_DIR):
-        fpath = os.path.join(UPLOAD_DIR, fname)
-        if os.path.isfile(fpath):
-            try:
-                os.remove(fpath)
-            except Exception:
-                pass
-    return {"message": "All documents cleared successfully.", "documents": [], "active_document": None}
+
+    # 3. Clean up staging folder
+    if os.path.exists(UPLOAD_DIR):
+        for fname in os.listdir(UPLOAD_DIR):
+            fpath = os.path.join(UPLOAD_DIR, fname)
+            if os.path.isfile(fpath):
+                try:
+                    os.remove(fpath)
+                except Exception:
+                    pass
+    return {"message": "All custom documents cleared successfully.", "documents": [], "active_document": get_current_selected_doc()}
 
 # ==========================================
 # Google Auth & Chat History Endpoints
@@ -371,21 +511,34 @@ def restore_chat_documents(conversation_id: int):
             "active_document": get_current_selected_doc()
         }
 
-    # Re-index PDFs that are in the session and present in uploads folder
+    # Re-index PDFs that are in the session using Neon PostgreSQL
     if target_docs:
-        engine.clear_all()
+        engine.clear_all(preserve_builtin=True)
         selected_document = None
         restored = []
-        for doc_name in target_docs:
-            saved_path = os.path.join(UPLOAD_DIR, doc_name)
-            if os.path.exists(saved_path):
-                try:
-                    engine.add_pdf(saved_path, filename=doc_name)
-                    restored.append(doc_name)
-                    if selected_document is None:
-                        selected_document = doc_name
-                except Exception as e:
-                    print(f"Warning: could not restore {doc_name}: {e}")
+        db = SessionLocal()
+        try:
+            for doc_name in target_docs:
+                if doc_name == "Operating_Systems_Core_Guide.pdf":
+                    continue
+                saved_path = os.path.join(UPLOAD_DIR, doc_name)
+                # If file is not present locally, retrieve binary content from Neon PostgreSQL
+                if not os.path.exists(saved_path) or os.path.getsize(saved_path) == 0:
+                    doc_rec = db.query(DocumentRecord).filter(DocumentRecord.filename == doc_name).first()
+                    if doc_rec and doc_rec.file_data:
+                        with open(saved_path, "wb") as f:
+                            f.write(doc_rec.file_data)
+
+                if os.path.exists(saved_path):
+                    try:
+                        engine.add_pdf(saved_path, filename=doc_name)
+                        restored.append(doc_name)
+                        if selected_document is None:
+                            selected_document = doc_name
+                    except Exception as e:
+                        print(f"Warning: could not restore {doc_name}: {e}")
+        finally:
+            db.close()
 
         return {
             "status": "restored",
@@ -421,9 +574,6 @@ def save_chat_message(payload: SaveMessageRequest):
 @app.post("/api/chat")
 async def chat_query(payload: QueryRequest):
     docs = engine.get_documents()
-    if not docs:
-        raise HTTPException(status_code=400, detail="No documents currently loaded. Upload up to 5 PDFs first.")
-
     history_dict = [{"role": msg.role, "content": msg.content} for msg in payload.chat_history]
     result = engine.query(question=payload.question, chat_history=history_dict)
 
@@ -434,7 +584,7 @@ async def chat_query(payload: QueryRequest):
             chat = db.query(Conversation).filter(Conversation.id == payload.conversation_id).first()
             if chat and not chat.documents:
                 # Snapshot active document names into the conversation
-                current_doc_names = [d["filename"] for d in docs]
+                current_doc_names = [d["filename"] for d in docs] if docs else ["Operating_Systems_Core_Guide.pdf"]
                 chat.documents = json.dumps(current_doc_names)
 
             user_msg = Message(
@@ -474,10 +624,6 @@ async def step_explain(payload: StepExplainRequest):
 
 @app.post("/api/study-guide")
 async def generate_guide():
-    docs = engine.get_documents()
-    if not docs:
-        raise HTTPException(status_code=400, detail="No documents currently loaded. Upload up to 5 PDFs first.")
-
     try:
         guide_md = engine.generate_study_guide()
         return {"study_guide": guide_md}

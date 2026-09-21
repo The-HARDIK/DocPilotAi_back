@@ -11,3 +11,13 @@ services:
         sync: false
       - key: FRONTEND_URL
         sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: CHROMA_API_KEY
+        sync: false
+      - key: CHROMA_TENANT
+        sync: false
+      - key: CHROMA_DATABASE
+        sync: false
+      - key: CHROMA_COLLECTION
+        sync: false
