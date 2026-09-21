@@ -11,6 +11,20 @@ from langchain_chroma import Chroma
 
 load_dotenv()
 
+def _extract_text(content: Any) -> str:
+    """Extracts raw text string from Gemini responses whether formatted as str or list of blocks."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts = []
+        for part in content:
+            if isinstance(part, dict) and "text" in part:
+                texts.append(part["text"])
+            elif isinstance(part, str):
+                texts.append(part)
+        return "".join(texts)
+    return str(content)
+
 class DocPilotEngine:
     MAX_DOCUMENTS = 5
 
@@ -25,9 +39,9 @@ class DocPilotEngine:
         self.doc_registry: Dict[str, Dict[str, Any]] = {}
         self.raw_documents_map: Dict[str, List[Any]] = {}
         
-        # Google Generative AI Embeddings (Free tier: models/text-embedding-004)
+        # Google Generative AI Embeddings (Free tier: models/gemini-embedding-001)
         self.embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/text-embedding-004",
+            model="models/gemini-embedding-001",
             google_api_key=self.api_key
         )
         
@@ -37,17 +51,15 @@ class DocPilotEngine:
             persist_directory=self.persist_directory
         )
 
-        self.default_model = "gemini-1.5-flash"
+        self.default_model = "models/gemini-3.6-flash"
 
-    def _get_llm(self, model: Optional[str] = None, temperature: float = 0.1, max_tokens: Optional[int] = None) -> ChatGoogleGenerativeAI:
+    def _get_llm(self, model: Optional[str] = None, max_tokens: Optional[int] = None) -> ChatGoogleGenerativeAI:
         chosen_model = model or self.default_model
-        # Map any legacy model names or default to gemini-1.5-flash
-        if not chosen_model.startswith("gemini"):
-            chosen_model = "gemini-1.5-flash"
+        if not chosen_model.startswith("models/"):
+            chosen_model = f"models/{chosen_model}" if "gemini" in chosen_model else self.default_model
         return ChatGoogleGenerativeAI(
             model=chosen_model,
             google_api_key=self.api_key,
-            temperature=temperature,
             max_output_tokens=max_tokens
         )
 
@@ -187,9 +199,9 @@ class DocPilotEngine:
         )
 
         try:
-            llm = self._get_llm(model=model, temperature=0.0, max_tokens=120)
+            llm = self._get_llm(model=model, max_tokens=120)
             resp = llm.invoke(rephrase_prompt)
-            return resp.content.strip()
+            return _extract_text(resp.content).strip()
         except Exception:
             return question
 
@@ -266,9 +278,9 @@ class DocPilotEngine:
         )
 
         try:
-            llm = self._get_llm(model=selected_model, temperature=0.1, max_tokens=1500)
+            llm = self._get_llm(model=selected_model, max_tokens=1500)
             resp = llm.invoke(messages)
-            answer = resp.content
+            answer = _extract_text(resp.content)
         except Exception as e:
             answer = f"Error communicating with Gemini API: {str(e)}"
 
@@ -279,7 +291,7 @@ class DocPilotEngine:
         }
 
     def generate_study_guide(self, model: Optional[str] = None, progress_callback=None) -> str:
-        """Map-reduce summarization with dynamic model selection and token safety across documents."""
+        """Map-reduce summarization with dynamic model selection across documents."""
         if not self.raw_documents:
             raise ValueError("No documents are currently loaded. Please upload at least one PDF first.")
 
@@ -290,7 +302,7 @@ class DocPilotEngine:
         batch_size = 4
         batches = [self.raw_documents[i:i + batch_size] for i in range(0, total_pages, batch_size)]
 
-        llm_map = self._get_llm(model=selected_model, temperature=0.1, max_tokens=350)
+        llm_map = self._get_llm(model=selected_model, max_tokens=350)
 
         for idx, batch in enumerate(batches):
             if progress_callback:
@@ -318,7 +330,7 @@ class DocPilotEngine:
 
             try:
                 resp = llm_map.invoke(map_prompt)
-                page_summaries.append(resp.content.strip())
+                page_summaries.append(_extract_text(resp.content).strip())
             except Exception as e:
                 page_summaries.append(f"Section Summary: {str(e)}")
 
@@ -344,10 +356,10 @@ class DocPilotEngine:
         )
 
         try:
-            llm_reduce = self._get_llm(model=selected_model, temperature=0.1, max_tokens=1800)
+            llm_reduce = self._get_llm(model=selected_model, max_tokens=1800)
             final_resp = llm_reduce.invoke(reduce_prompt)
             if progress_callback:
                 progress_callback(1.0, "Study Guide Ready!")
-            return final_resp.content
+            return _extract_text(final_resp.content)
         except Exception as e:
             return f"Error synthesizing final study guide: {str(e)}"
