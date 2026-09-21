@@ -1,4 +1,5 @@
 import os
+import re
 import time
 from typing import Dict, Any, List, Optional
 from dotenv import load_dotenv
@@ -25,6 +26,44 @@ def _extract_text(content: Any) -> str:
         return "".join(texts)
     return str(content)
 
+class RateLimitedGeminiEmbeddings(GoogleGenerativeAIEmbeddings):
+    """Wraps GoogleGenerativeAIEmbeddings to safely batch and respect the 100 requests/minute free-tier quota."""
+
+    def embed_documents(self, texts: List[str], **kwargs) -> List[List[float]]:
+        if not texts:
+            return []
+
+        batch_size = 70  # Safe batch size below the 100/min quota
+        all_embeddings: List[List[float]] = []
+
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            max_retries = 4
+
+            for attempt in range(max_retries):
+                try:
+                    res = super().embed_documents(batch, **kwargs)
+                    all_embeddings.extend(res)
+                    break
+                except Exception as e:
+                    err_str = str(e)
+                    if ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str) and attempt < max_retries - 1:
+                        delay = 40.0
+                        match = re.search(r"retry in ([\d\.]+)s", err_str)
+                        if match:
+                            delay = float(match.group(1)) + 2.0
+                        print(f"[DocPilot] Gemini free-tier rate limit reached. Auto-waiting {delay:.1f}s before retry (attempt {attempt + 1}/{max_retries})...")
+                        time.sleep(delay)
+                    else:
+                        raise e
+
+            # If more batches remain, pause to allow per-minute quota to replenish
+            if i + batch_size < len(texts):
+                print(f"[DocPilot] Embedded {len(all_embeddings)}/{len(texts)} chunks. Pausing 15s to respect Gemini API rate limits...")
+                time.sleep(15)
+
+        return all_embeddings
+
 class DocPilotEngine:
     MAX_DOCUMENTS = 5
 
@@ -39,8 +78,8 @@ class DocPilotEngine:
         self.doc_registry: Dict[str, Dict[str, Any]] = {}
         self.raw_documents_map: Dict[str, List[Any]] = {}
         
-        # Google Generative AI Embeddings (Free tier: models/gemini-embedding-001)
-        self.embeddings = GoogleGenerativeAIEmbeddings(
+        # Google Generative AI Embeddings with automatic rate limiting and retry handling
+        self.embeddings = RateLimitedGeminiEmbeddings(
             model="models/gemini-embedding-001",
             google_api_key=self.api_key
         )
@@ -149,8 +188,9 @@ class DocPilotEngine:
             page.metadata["doc_name"] = doc_name
             page.metadata["source"] = pdf_path
 
+        # 1600 characters gives high semantic cohesion and cuts request count to avoid quota limits
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
+            chunk_size=1600,
             chunk_overlap=200,
             separators=["\n\n", "\n", ". ", " ", ""]
         )
