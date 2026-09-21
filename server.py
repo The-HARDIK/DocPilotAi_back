@@ -457,6 +457,21 @@ async def chat_query(payload: QueryRequest):
 
     return result
 
+class StepExplainRequest(BaseModel):
+    question: str
+    answer: str
+
+@app.post("/api/step-explain")
+async def step_explain(payload: StepExplainRequest):
+    """Generates a step-by-step walkthrough of a numerical or conceptual answer."""
+    if not payload.question or not payload.answer:
+        raise HTTPException(status_code=400, detail="Both question and answer are required.")
+    try:
+        result = engine.step_explain(question=payload.question, answer=payload.answer)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/study-guide")
 async def generate_guide():
     docs = engine.get_documents()

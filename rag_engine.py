@@ -300,12 +300,14 @@ class DocPilotEngine:
             SystemMessage(
                 content=(
                     "You are DocPilot AI, an expert academic tutor and technical assistant.\n"
-                    "Rules:\n"
-                    "1. Explain the concepts thoroughly, clearly, and in plain language using the provided context.\n"
-                    "2. When comparing items or listing registers/instructions, format them into neat Markdown tables.\n"
-                    "3. Cite specific Document names and Page numbers (e.g. [Document.pdf, Page X]).\n"
-                    "4. When information comes from different uploaded documents, synthesize or contrast them clearly.\n"
-                    "5. If a specific detail is entirely absent from the text, state what is missing rather than giving a generic refusal."
+                    "Formatting Rules:\n"
+                    "1. Explain the concepts thoroughly, clearly, and step-by-step using the provided context.\n"
+                    "2. TABLES: Whenever presenting structured data, process tables, comparison matrices, or registers, ALWAYS format them strictly as standard GitHub-flavored Markdown tables with header pipes (e.g. | Process | AT | BT | and |---|---|---|). NEVER output raw tabs or whitespace-separated columns.\n"
+                    "3. GANTT CHARTS & DIAGRAMS: Whenever illustrating Gantt charts, ASCII timelines, execution flows, or queue states (e.g. +---+---+ or [P1, P2]), ALWAYS wrap them inside fenced code blocks (```text ... ```) so spaces, alignment, and monospace formatting are preserved.\n"
+                    "4. MATH & FORMULAS: Present calculations cleanly. You may use standard LaTeX $...$ for inline math or $$...$$ for display formulas, or clean readable arithmetic (e.g. (9 + 7 + 3) / 3 = 19 / 3 = 6.33 ms).\n"
+                    "5. CITATIONS: Always cite specific Document names and Page numbers (e.g. [Document.pdf, Page X]).\n"
+                    "6. MISSING CONTEXT: If a specific detail or numerical value is absent from the text, state clearly what is missing rather than giving a generic refusal.\n"
+                    "7. MULTI-DOC: When information comes from different uploaded documents, synthesize or contrast them clearly."
                 )
             )
         ]
@@ -332,6 +334,72 @@ class DocPilotEngine:
             "sources": sources,
             "standalone_query": search_query
         }
+
+    def step_explain(self, question: str, answer: str, model: Optional[str] = None) -> Dict[str, Any]:
+        """Generates a step-by-step walkthrough of a numerical problem or conceptual demonstration."""
+        selected_model = model or self.default_model
+
+        system_prompt = (
+            "You are DocPilot AI Step-by-Step Tutor.\n"
+            "The student has already received a summary answer. Now they clicked 'Step-by-Step Explain' and want a "
+            "detailed, animated walkthrough.\n\n"
+            "RULES:\n"
+            "1. Break the solution into clear, numbered steps. Each step should be a complete, self-contained unit.\n"
+            "2. Start each step with '### Step N: <Title>' on its own line.\n"
+            "3. For NUMERICAL PROBLEMS (scheduling, calculations, algorithms):\n"
+            "   - Show the input data as a Markdown table first.\n"
+            "   - Walk through each iteration/time-unit showing intermediate state.\n"
+            "   - Show Gantt charts or queue states in fenced ```text``` code blocks.\n"
+            "   - Show all arithmetic explicitly (e.g. TAT = CT - AT = 9 - 0 = 9).\n"
+            "   - End with a final results table.\n"
+            "4. For CONCEPTUAL/PROCESS explanations:\n"
+            "   - Walk through the mechanism phase by phase.\n"
+            "   - Use concrete examples from the document context.\n"
+            "   - Use diagrams in ```text``` code blocks where helpful.\n"
+            "5. FORMAT: Use standard Markdown tables (| col | col |), fenced code blocks, "
+            "and LaTeX math ($...$) throughout. NEVER use raw tabs.\n"
+            "6. Each step should make sense on its own since they will be revealed one at a time.\n"
+            "7. Be thorough — if the student asked for a numerical solution, solve it completely."
+        )
+
+        user_prompt = (
+            f"Original Question: {question}\n\n"
+            f"Summary Answer Already Given:\n{answer}\n\n"
+            "Now produce the full step-by-step walkthrough as described in your rules."
+        )
+
+        try:
+            llm = self._get_llm(model=selected_model, max_tokens=4096)
+            full_response = self._invoke_llm_with_retry(llm, [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_prompt)
+            ])
+
+            # Split the response into individual steps by "### Step" headers
+            import re as _re
+            step_blocks = _re.split(r'(?=^### Step )', full_response, flags=_re.MULTILINE)
+            steps = [s.strip() for s in step_blocks if s.strip()]
+
+            # If the model didn't follow the format, just split by double newlines
+            if len(steps) <= 1:
+                raw_steps = full_response.split("\n\n")
+                steps = []
+                for idx, chunk in enumerate(raw_steps):
+                    chunk = chunk.strip()
+                    if chunk:
+                        if not chunk.startswith("###"):
+                            chunk = f"### Step {idx + 1}\n{chunk}"
+                        steps.append(chunk)
+
+            return {
+                "steps": steps,
+                "total_steps": len(steps)
+            }
+        except Exception as e:
+            return {
+                "steps": [f"### Error\nCould not generate step-by-step explanation: {str(e)}"],
+                "total_steps": 1
+            }
 
     def generate_study_guide(self, model: Optional[str] = None, progress_callback=None) -> str:
         """Map-reduce summarization with dynamic model selection across documents."""
