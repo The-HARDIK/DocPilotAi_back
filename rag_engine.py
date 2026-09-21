@@ -5,9 +5,9 @@ from dotenv import load_dotenv
 
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_chroma import Chroma
-from groq import Groq
 
 load_dotenv()
 
@@ -18,19 +18,17 @@ class DocPilotEngine:
         self.persist_directory = os.path.abspath(persist_directory)
         self.collection_name = collection_name
         
-        self.api_key = os.getenv("GROQ_API_KEY")
+        self.api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
         if not self.api_key:
-            raise ValueError("Missing GROQ_API_KEY in .env file.")
+            raise ValueError("Missing GEMINI_API_KEY in .env file. Get one for free at https://aistudio.google.com/app/apikey")
         
-        self.client = Groq(api_key=self.api_key)
         self.doc_registry: Dict[str, Dict[str, Any]] = {}
         self.raw_documents_map: Dict[str, List[Any]] = {}
         
-        # Local CPU embeddings (BAAI/bge-small-en-v1.5)
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name="BAAI/bge-small-en-v1.5",
-            model_kwargs={"device": "cpu"},
-            encode_kwargs={"normalize_embeddings": True}
+        # Google Generative AI Embeddings (Free tier: models/text-embedding-004)
+        self.embeddings = GoogleGenerativeAIEmbeddings(
+            model="models/text-embedding-004",
+            google_api_key=self.api_key
         )
         
         self.vector_store = Chroma(
@@ -39,26 +37,19 @@ class DocPilotEngine:
             persist_directory=self.persist_directory
         )
 
-    def _get_active_model(self) -> str:
-        """Dynamically queries Groq to find an active, supported chat model on your account."""
-        preferred_priority = [
-            "llama-3.3-70b-versatile",
-            "llama-3.1-8b-instant",
-            "openai/gpt-oss-20b",
-            "llama3-8b-8192",
-            "llama3-70b-8192",
-            "mixtral-8x7b-32768",
-            "gemma2-9b-it"
-        ]
-        try:
-            available_models = [m.id for m in self.client.models.list().data]
-            for model_name in preferred_priority:
-                if model_name in available_models:
-                    return model_name
-            # Fallback to the first available model if none of the preferred match
-            return available_models[0] if available_models else "llama3-8b-8192"
-        except Exception:
-            return "llama-3.1-8b-instant"
+        self.default_model = "gemini-1.5-flash"
+
+    def _get_llm(self, model: Optional[str] = None, temperature: float = 0.1, max_tokens: Optional[int] = None) -> ChatGoogleGenerativeAI:
+        chosen_model = model or self.default_model
+        # Map any legacy model names or default to gemini-1.5-flash
+        if not chosen_model.startswith("gemini"):
+            chosen_model = "gemini-1.5-flash"
+        return ChatGoogleGenerativeAI(
+            model=chosen_model,
+            google_api_key=self.api_key,
+            temperature=temperature,
+            max_output_tokens=max_tokens
+        )
 
     @property
     def raw_documents(self) -> List[Any]:
@@ -196,13 +187,9 @@ class DocPilotEngine:
         )
 
         try:
-            resp = self.client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": rephrase_prompt}],
-                temperature=0.0,
-                max_tokens=120
-            )
-            return resp.choices[0].message.content.strip()
+            llm = self._get_llm(model=model, temperature=0.0, max_tokens=120)
+            resp = llm.invoke(rephrase_prompt)
+            return resp.content.strip()
         except Exception:
             return question
 
@@ -222,7 +209,7 @@ class DocPilotEngine:
         if collection_count == 0:
             return {"answer": "No documents are currently indexed.", "sources": []}
 
-        selected_model = model or self._get_active_model()
+        selected_model = model or self.default_model
 
         search_query = cleaned_question
         if chat_history and len(chat_history) > 0:
@@ -254,9 +241,8 @@ class DocPilotEngine:
         joined_context = "\n\n".join(formatted_context_list)
 
         messages = [
-            {
-                "role": "system",
-                "content": (
+            SystemMessage(
+                content=(
                     "You are DocPilot AI, an expert academic tutor and technical assistant.\n"
                     "Rules:\n"
                     "1. Explain the concepts thoroughly, clearly, and in plain language using the provided context.\n"
@@ -265,28 +251,26 @@ class DocPilotEngine:
                     "4. When information comes from different uploaded documents, synthesize or contrast them clearly.\n"
                     "5. If a specific detail is entirely absent from the text, state what is missing rather than giving a generic refusal."
                 )
-            }
+            )
         ]
 
         if chat_history:
             for turn in chat_history[-4:]:
-                messages.append({"role": turn["role"], "content": turn["content"]})
+                if turn.get("role") == "user":
+                    messages.append(HumanMessage(content=turn.get("content", "")))
+                else:
+                    messages.append(AIMessage(content=turn.get("content", "")))
 
-        messages.append({
-            "role": "user",
-            "content": f"Context:\n{joined_context}\n\nQuestion: {cleaned_question}"
-        })
+        messages.append(
+            HumanMessage(content=f"Context:\n{joined_context}\n\nQuestion: {cleaned_question}")
+        )
 
         try:
-            chat_completion = self.client.chat.completions.create(
-                model=selected_model,
-                messages=messages,
-                temperature=0.1,
-                max_tokens=1500
-            )
-            answer = chat_completion.choices[0].message.content
+            llm = self._get_llm(model=selected_model, temperature=0.1, max_tokens=1500)
+            resp = llm.invoke(messages)
+            answer = resp.content
         except Exception as e:
-            answer = f"Error communicating with LLM API: {str(e)}"
+            answer = f"Error communicating with Gemini API: {str(e)}"
 
         return {
             "answer": answer,
@@ -299,12 +283,14 @@ class DocPilotEngine:
         if not self.raw_documents:
             raise ValueError("No documents are currently loaded. Please upload at least one PDF first.")
 
-        selected_model = model or self._get_active_model()
+        selected_model = model or self.default_model
         total_pages = len(self.raw_documents)
         page_summaries = []
 
         batch_size = 4
         batches = [self.raw_documents[i:i + batch_size] for i in range(0, total_pages, batch_size)]
+
+        llm_map = self._get_llm(model=selected_model, temperature=0.1, max_tokens=350)
 
         for idx, batch in enumerate(batches):
             if progress_callback:
@@ -331,17 +317,12 @@ class DocPilotEngine:
             )
 
             try:
-                resp = self.client.chat.completions.create(
-                    model=selected_model,
-                    messages=[{"role": "user", "content": map_prompt}],
-                    temperature=0.1,
-                    max_tokens=350
-                )
-                page_summaries.append(resp.choices[0].message.content.strip())
+                resp = llm_map.invoke(map_prompt)
+                page_summaries.append(resp.content.strip())
             except Exception as e:
                 page_summaries.append(f"Section Summary: {str(e)}")
 
-            time.sleep(0.4)
+            time.sleep(0.3)
 
         if progress_callback:
             progress_callback(0.95, "Synthesizing master study guide...")
@@ -363,14 +344,10 @@ class DocPilotEngine:
         )
 
         try:
-            final_resp = self.client.chat.completions.create(
-                model=selected_model,
-                messages=[{"role": "user", "content": reduce_prompt}],
-                temperature=0.1,
-                max_tokens=1800
-            )
+            llm_reduce = self._get_llm(model=selected_model, temperature=0.1, max_tokens=1800)
+            final_resp = llm_reduce.invoke(reduce_prompt)
             if progress_callback:
                 progress_callback(1.0, "Study Guide Ready!")
-            return final_resp.choices[0].message.content
+            return final_resp.content
         except Exception as e:
             return f"Error synthesizing final study guide: {str(e)}"
