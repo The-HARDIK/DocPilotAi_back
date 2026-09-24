@@ -132,11 +132,13 @@ class DocPilotEngine:
         if not chosen_model.startswith("models/"):
             chosen_model = f"models/{chosen_model}" if "gemini" in chosen_model else self.default_model
 
-        # Map experimental or future aliases gracefully to active production endpoints
+        # Map experimental or future aliases gracefully to fast active production endpoints
         model_aliases = {
-            "models/gemini-3.8-flash-latest": "models/gemini-flash-latest",
-            "models/gemini-3.6-flash": "models/gemini-flash-lite-latest",
-            "models/gemini-3.5-flash": "models/gemini-flash-latest",
+            "models/gemini-3.8-flash-latest": "models/gemini-2.5-flash",
+            "models/gemini-3.6-flash": "models/gemini-2.5-flash-lite",
+            "models/gemini-3.5-flash": "models/gemini-2.5-flash",
+            "models/gemini-flash-latest": "models/gemini-2.5-flash",
+            "models/gemini-flash-lite-latest": "models/gemini-2.5-flash-lite",
         }
         chosen_model = model_aliases.get(chosen_model, chosen_model)
 
@@ -323,6 +325,13 @@ class DocPilotEngine:
         if not chat_history:
             return question
 
+        # Skip extra LLM latency if the question is already detailed and self-contained
+        words = question.lower().split()
+        ambiguous_triggers = {"it", "this", "that", "these", "those", "why", "how", "more", "again", "explain", "what about"}
+        is_short_or_ambiguous = len(words) < 6 or any(w.strip("?,.!") in ambiguous_triggers for w in words[:3])
+        if not is_short_or_ambiguous:
+            return question
+
         history_summary = "\n".join([f"{msg['role']}: {msg['content']}" for msg in chat_history[-4:]])
         
         rephrase_prompt = (
@@ -343,7 +352,7 @@ class DocPilotEngine:
         self, 
         question: str, 
         chat_history: Optional[List[Dict[str, str]]] = None,
-        top_k: int = 8, 
+        top_k: int = 4, 
         model: Optional[str] = None
     ) -> Dict[str, Any]:
         """Performs contextual retrieval and multi-turn response generation."""
