@@ -9,7 +9,6 @@ from pydantic import BaseModel
 from google.oauth2 import id_token
 from google.auth.transport import requests as grequests
 
-from rag_engine import DocPilotEngine
 from database import init_db, SessionLocal, User, Conversation, Message, DocumentRecord
 
 import threading
@@ -45,11 +44,12 @@ app.add_middleware(
 _engine_instance = None
 _engine_lock = threading.Lock()
 
-def get_rag_engine() -> DocPilotEngine:
+def get_rag_engine():
     global _engine_instance
     if _engine_instance is None:
         with _engine_lock:
             if _engine_instance is None:
+                from rag_engine import DocPilotEngine
                 _engine_instance = DocPilotEngine()
     return _engine_instance
 
@@ -57,7 +57,7 @@ class EngineProxy:
     def __getattr__(self, name):
         return getattr(get_rag_engine(), name)
 
-engine: DocPilotEngine = EngineProxy()  # type: ignore
+engine = EngineProxy()
 
 # Dedicated storage folder for active documents
 UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploaded_docs")
