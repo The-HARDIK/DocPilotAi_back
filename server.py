@@ -12,8 +12,7 @@ from google.auth.transport import requests as grequests
 from rag_engine import DocPilotEngine
 from database import init_db, SessionLocal, User, Conversation, Message, DocumentRecord
 
-# Initialize DB on startup
-init_db()
+import threading
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "247202504530-chsa46107gb9ii7l9aob0spg945fg6pq.apps.googleusercontent.com")
 
@@ -25,6 +24,7 @@ allowed_origins = [
     "http://127.0.0.1:5173",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "https://doc-pilot-ai-front.vercel.app",
 ]
 frontend_env = os.getenv("FRONTEND_URL")
 if frontend_env:
@@ -42,33 +42,63 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-engine = DocPilotEngine()
-# Auto-index built-in Operating Systems knowledge guide on startup
-engine.ensure_default_os_knowledge()
+_engine_instance = None
+_engine_lock = threading.Lock()
+
+def get_rag_engine() -> DocPilotEngine:
+    global _engine_instance
+    if _engine_instance is None:
+        with _engine_lock:
+            if _engine_instance is None:
+                _engine_instance = DocPilotEngine()
+    return _engine_instance
+
+class EngineProxy:
+    def __getattr__(self, name):
+        return getattr(get_rag_engine(), name)
+
+engine: DocPilotEngine = EngineProxy()  # type: ignore
 
 # Dedicated storage folder for active documents
 UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploaded_docs")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# Synchronize custom documents stored in Neon PostgreSQL into active index on startup
-try:
-    _init_db_session = SessionLocal()
-    _stored_docs = _init_db_session.query(DocumentRecord).all()
-    for _doc in _stored_docs:
-        _cached_path = os.path.join(UPLOAD_DIR, _doc.filename)
-        if not os.path.exists(_cached_path) or os.path.getsize(_cached_path) == 0:
-            with open(_cached_path, "wb") as _f:
-                _f.write(_doc.file_data)
-        if _doc.filename not in engine.doc_registry:
-            try:
-                engine.add_pdf(_cached_path, filename=_doc.filename)
-            except Exception as _e:
-                print(f"[DocPilot] Note: could not index {_doc.filename} on startup: {_e}")
-    _init_db_session.close()
-    if _stored_docs:
-        print(f"[DocPilot] Restored {len(_stored_docs)} document(s) from Neon PostgreSQL into active index.")
-except Exception as _sync_err:
-    print(f"[DocPilot] Note on startup Neon document sync: {_sync_err}")
+def _background_startup_tasks():
+    """Runs heavy initialization in background so Uvicorn can immediately pass Render health checks."""
+    try:
+        init_db()
+        print("[DocPilot] Database initialized successfully.")
+    except Exception as e:
+        print(f"[DocPilot] Note during database init: {e}")
+
+    try:
+        engine.ensure_default_os_knowledge()
+    except Exception as e:
+        print(f"[DocPilot] Note indexing default OS guide: {e}")
+
+    try:
+        _init_db_session = SessionLocal()
+        _stored_docs = _init_db_session.query(DocumentRecord).all()
+        for _doc in _stored_docs:
+            _cached_path = os.path.join(UPLOAD_DIR, _doc.filename)
+            if not os.path.exists(_cached_path) or os.path.getsize(_cached_path) == 0:
+                with open(_cached_path, "wb") as _f:
+                    _f.write(_doc.file_data)
+            if _doc.filename not in engine.doc_registry:
+                try:
+                    engine.add_pdf(_cached_path, filename=_doc.filename)
+                except Exception as _e:
+                    print(f"[DocPilot] Note: could not index {_doc.filename} on startup: {_e}")
+        _init_db_session.close()
+        if _stored_docs:
+            print(f"[DocPilot] Restored {len(_stored_docs)} document(s) from Neon PostgreSQL into active index.")
+    except Exception as _sync_err:
+        print(f"[DocPilot] Note on startup Neon document sync: {_sync_err}")
+
+@app.on_event("startup")
+async def on_startup():
+    # Spawns thread so server port binds immediately and passes health checks in <500ms
+    threading.Thread(target=_background_startup_tasks, daemon=True).start()
 
 # Tracks which document is currently active in the viewer
 selected_document: Optional[str] = None

@@ -43,13 +43,11 @@ def get_engine():
                 pool_pre_ping=True,
                 pool_recycle=300
             )
-            with pg_engine.connect() as conn:
-                pass
-            print("[DocPilot] Connected to Neon PostgreSQL cloud database.")
+            print("[DocPilot] Initialized Neon PostgreSQL cloud database engine.")
             return pg_engine
         except Exception as e:
-            print(f"[DocPilot] Connection to Neon PostgreSQL failed: {e}")
-            raise ConnectionError(f"Failed to connect to Neon PostgreSQL cloud database: {e}")
+            print(f"[DocPilot] Engine creation for Neon PostgreSQL failed: {e}")
+            raise ConnectionError(f"Failed to initialize Neon PostgreSQL database engine: {e}")
 
     raise ValueError("DATABASE_URL is not configured. Please supply a valid Neon PostgreSQL connection string in .env.")
 
