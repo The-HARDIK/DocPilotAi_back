@@ -75,8 +75,8 @@ class DocPilotEngine:
         else:
             self.vector_store = self._init_local_chroma()
 
-        self.default_model = "models/gemini-3.5-flash-lite"
-        self.fallback_model = "models/gemini-3-flash-preview"
+        self.default_model = os.getenv("GEMINI_MODEL", "models/gemini-3.5-flash-lite")
+        self.fallback_model = "models/gemini-3.6-flash"
         self._cached_study_guide: Dict[str, str] = {}
 
     def _init_local_chroma(self) -> Chroma:
@@ -134,15 +134,15 @@ class DocPilotEngine:
 
         # Map experimental or future aliases gracefully to active production endpoint with available quota
         model_aliases = {
-            "models/gemini-3.8-flash-latest": "models/gemini-3.5-flash-lite",
-            "models/gemini-3.6-flash": "models/gemini-3.5-flash-lite",
-            "models/gemini-3.5-flash": "models/gemini-3.5-flash-lite",
-            "models/gemini-flash-latest": "models/gemini-3.5-flash-lite",
+            "models/gemini-3.8-flash-latest": "models/gemini-3.6-flash",
+            "models/gemini-3.6-flash": "models/gemini-3.6-flash",
+            "models/gemini-3.5-flash": "models/gemini-3.6-flash",
+            "models/gemini-flash-latest": "models/gemini-3.6-flash",
             "models/gemini-flash-lite-latest": "models/gemini-3.5-flash-lite",
-            "models/gemini-2.5-flash": "models/gemini-3.5-flash-lite",
+            "models/gemini-2.5-flash": "models/gemini-3.6-flash",
             "models/gemini-2.5-flash-lite": "models/gemini-3.5-flash-lite",
         }
-        chosen_model = model_aliases.get(chosen_model, "models/gemini-3.5-flash-lite")
+        chosen_model = model_aliases.get(chosen_model, "models/gemini-3.6-flash")
 
         return ChatGoogleGenerativeAI(
             model=chosen_model,
@@ -150,23 +150,67 @@ class DocPilotEngine:
             max_output_tokens=max_tokens
         )
 
-    def _invoke_llm_with_retry(self, llm: ChatGoogleGenerativeAI, prompt_or_messages: Any, max_retries: int = 3) -> str:
-        """Invokes Gemini LLM with automatic rate-limit backoff and resilient fallback."""
-        current_llm = llm
+    def _invoke_llm_with_retry(self, llm_or_model: Any, prompt_or_messages: Any, max_tokens: int = 4096, max_retries: int = 3) -> str:
+        """Invokes Gemini LLM directly using google-genai SDK for ultra-fast (2-5s) inference."""
+        from google import genai
+        from google.genai import types
+
+        model_name = self.default_model
+        if isinstance(llm_or_model, str):
+            model_name = llm_or_model
+        elif hasattr(llm_or_model, "model"):
+            model_name = getattr(llm_or_model, "model", self.default_model)
+
+        clean_model = model_name.replace("models/", "")
+
+        system_text = ""
+        contents = []
+        if isinstance(prompt_or_messages, list):
+            for msg in prompt_or_messages:
+                if isinstance(msg, SystemMessage):
+                    system_text += msg.content + "\n"
+                elif isinstance(msg, HumanMessage):
+                    contents.append(f"{msg.content}")
+                elif isinstance(msg, AIMessage):
+                    contents.append(f"Assistant: {msg.content}")
+                elif isinstance(msg, dict):
+                    role = msg.get("role", "user")
+                    content = msg.get("content", "")
+                    contents.append(f"{role.capitalize()}: {content}")
+                else:
+                    contents.append(str(msg))
+            full_content = "\n\n".join(contents)
+        else:
+            full_content = str(prompt_or_messages)
+
+        client = genai.Client(api_key=self.api_key)
+        config = types.GenerateContentConfig(
+            max_output_tokens=max_tokens,
+            system_instruction=system_text.strip() if system_text else None,
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        )
+
+        current_model = clean_model
         last_error = None
+
         for attempt in range(max_retries):
             try:
-                resp = current_llm.invoke(prompt_or_messages)
-                text = _extract_text(resp.content)
+                resp = client.models.generate_content(
+                    model=current_model,
+                    contents=full_content,
+                    config=config
+                )
+                text = resp.text or ""
                 if text.strip():
                     return text
             except Exception as e:
                 last_error = e
                 err_str = str(e)
                 if ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "404" in err_str or "503" in err_str or "UNAVAILABLE" in err_str or "high demand" in err_str.lower()):
-                    if current_llm.model != self.fallback_model:
-                        print(f"[DocPilot] Model {current_llm.model} limit reached or unavailable ({err_str[:60]}). Switching to fallback: {self.fallback_model}")
-                        current_llm = self._get_llm(model=self.fallback_model, max_tokens=current_llm.max_output_tokens)
+                    fallback_clean = self.fallback_model.replace("models/", "")
+                    if current_model != fallback_clean:
+                        print(f"[DocPilot] Model {current_model} busy/unavailable ({err_str[:60]}). Switching to fallback: {fallback_clean}")
+                        current_model = fallback_clean
                         continue
                     delay = 3.0
                     match = re.search(r"retry in ([\d\.]+)s", err_str)
