@@ -75,8 +75,8 @@ class DocPilotEngine:
         else:
             self.vector_store = self._init_local_chroma()
 
-        self.default_model = "models/gemini-3.8-flash-latest"
-        self.fallback_model = "models/gemini-flash-lite-latest"
+        self.default_model = "models/gemini-3.5-flash-lite"
+        self.fallback_model = "models/gemini-3-flash-preview"
         self._cached_study_guide: Dict[str, str] = {}
 
     def _init_local_chroma(self) -> Chroma:
@@ -132,15 +132,17 @@ class DocPilotEngine:
         if not chosen_model.startswith("models/"):
             chosen_model = f"models/{chosen_model}" if "gemini" in chosen_model else self.default_model
 
-        # Map experimental or future aliases gracefully to fast active production endpoints
+        # Map experimental or future aliases gracefully to active production endpoint with available quota
         model_aliases = {
-            "models/gemini-3.8-flash-latest": "models/gemini-2.5-flash",
-            "models/gemini-3.6-flash": "models/gemini-2.5-flash-lite",
-            "models/gemini-3.5-flash": "models/gemini-2.5-flash",
-            "models/gemini-flash-latest": "models/gemini-2.5-flash",
-            "models/gemini-flash-lite-latest": "models/gemini-2.5-flash-lite",
+            "models/gemini-3.8-flash-latest": "models/gemini-3.5-flash-lite",
+            "models/gemini-3.6-flash": "models/gemini-3.5-flash-lite",
+            "models/gemini-3.5-flash": "models/gemini-3.5-flash-lite",
+            "models/gemini-flash-latest": "models/gemini-3.5-flash-lite",
+            "models/gemini-flash-lite-latest": "models/gemini-3.5-flash-lite",
+            "models/gemini-2.5-flash": "models/gemini-3.5-flash-lite",
+            "models/gemini-2.5-flash-lite": "models/gemini-3.5-flash-lite",
         }
-        chosen_model = model_aliases.get(chosen_model, chosen_model)
+        chosen_model = model_aliases.get(chosen_model, "models/gemini-3.5-flash-lite")
 
         return ChatGoogleGenerativeAI(
             model=chosen_model,
@@ -151,27 +153,32 @@ class DocPilotEngine:
     def _invoke_llm_with_retry(self, llm: ChatGoogleGenerativeAI, prompt_or_messages: Any, max_retries: int = 3) -> str:
         """Invokes Gemini LLM with automatic rate-limit backoff and resilient fallback."""
         current_llm = llm
+        last_error = None
         for attempt in range(max_retries):
             try:
                 resp = current_llm.invoke(prompt_or_messages)
-                return _extract_text(resp.content)
+                text = _extract_text(resp.content)
+                if text.strip():
+                    return text
             except Exception as e:
+                last_error = e
                 err_str = str(e)
                 if ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "404" in err_str or "503" in err_str or "UNAVAILABLE" in err_str or "high demand" in err_str.lower()):
-                    # Try falling back to high-capacity gemini-flash-lite-latest
                     if current_llm.model != self.fallback_model:
                         print(f"[DocPilot] Model {current_llm.model} limit reached or unavailable ({err_str[:60]}). Switching to fallback: {self.fallback_model}")
                         current_llm = self._get_llm(model=self.fallback_model, max_tokens=current_llm.max_output_tokens)
                         continue
-                    delay = 5.0
+                    delay = 3.0
                     match = re.search(r"retry in ([\d\.]+)s", err_str)
                     if match:
-                        delay = float(match.group(1)) + 1.5
+                        delay = float(match.group(1)) + 1.0
                     print(f"[DocPilot] Gemini service busy. Waiting {delay:.1f}s before retry (attempt {attempt + 1}/{max_retries})...")
                     time.sleep(delay)
                 else:
                     raise e
-        return ""
+        if last_error:
+            raise last_error
+        return "No answer could be generated. Please try asking in a slightly different way."
 
     @property
     def raw_documents(self) -> List[Any]:
