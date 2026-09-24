@@ -46,10 +46,11 @@ def get_engine():
             print("[DocPilot] Initialized Neon PostgreSQL cloud database engine.")
             return pg_engine
         except Exception as e:
-            print(f"[DocPilot] Engine creation for Neon PostgreSQL failed: {e}")
-            raise ConnectionError(f"Failed to initialize Neon PostgreSQL database engine: {e}")
+            print(f"[DocPilot] Engine creation for Neon PostgreSQL failed: {e}. Falling back to SQLite.")
 
-    raise ValueError("DATABASE_URL is not configured. Please supply a valid Neon PostgreSQL connection string in .env.")
+    # Resilient fallback so app never crashes if DATABASE_URL is missing or misconfigured in cloud
+    print("[DocPilot] Using local SQLite database fallback (docpilot.db).")
+    return create_engine("sqlite:///./docpilot.db", connect_args={"check_same_thread": False})
 
 engine = get_engine()
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

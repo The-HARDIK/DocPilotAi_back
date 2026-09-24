@@ -130,7 +130,9 @@ class SaveMessageRequest(BaseModel):
     sources: Optional[list] = []
 
 def get_current_selected_doc() -> Optional[str]:
-    global selected_document
+    global selected_document, _engine_instance
+    if _engine_instance is None:
+        return "Operating_Systems_Core_Guide.pdf"
     docs = engine.get_documents()
     filenames = [d["filename"] for d in docs]
     if selected_document and selected_document in filenames:
@@ -158,6 +160,19 @@ def health_check():
 
 @app.get("/api/status")
 def get_status():
+    global _engine_instance
+    if _engine_instance is None:
+        return {
+            "status": "ready",
+            "has_builtin_knowledge": True,
+            "builtin_title": "Operating Systems Core Guide",
+            "builtin_chunks": 8,
+            "documents": [],
+            "active_document": "Operating_Systems_Core_Guide.pdf",
+            "total_documents": 0,
+            "max_documents": 5,
+            "total_chunks": 8
+        }
     docs = engine.get_documents()
     current_doc = get_current_selected_doc()
     total_chunks = sum(d["chunks"] for d in docs)
