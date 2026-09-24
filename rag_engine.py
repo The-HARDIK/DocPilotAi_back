@@ -135,17 +135,18 @@ class DocPilotEngine:
         if not chosen_model.startswith("models/"):
             chosen_model = f"models/{chosen_model}" if "gemini" in chosen_model else self.default_model
 
-        # Map experimental or future aliases gracefully to active production endpoint with available quota
+        # Map experimental or legacy aliases gracefully to active production endpoints
         model_aliases = {
             "models/gemini-3.8-flash-latest": "models/gemini-3.6-flash",
             "models/gemini-3.6-flash": "models/gemini-3.6-flash",
-            "models/gemini-3.5-flash": "models/gemini-3.6-flash",
-            "models/gemini-flash-latest": "models/gemini-3.6-flash",
+            "models/gemini-3.5-flash": "models/gemini-3.5-flash-lite",
+            "models/gemini-3.5-flash-lite": "models/gemini-3.5-flash-lite",
+            "models/gemini-flash-latest": "models/gemini-3.5-flash-lite",
             "models/gemini-flash-lite-latest": "models/gemini-3.5-flash-lite",
-            "models/gemini-2.5-flash": "models/gemini-3.6-flash",
+            "models/gemini-2.5-flash": "models/gemini-3.5-flash-lite",
             "models/gemini-2.5-flash-lite": "models/gemini-3.5-flash-lite",
         }
-        chosen_model = model_aliases.get(chosen_model, "models/gemini-3.6-flash")
+        chosen_model = model_aliases.get(chosen_model, chosen_model)
 
         if ChatGoogleGenerativeAI is not None:
             return ChatGoogleGenerativeAI(
