@@ -7,7 +7,10 @@ from dotenv import load_dotenv
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
-from langchain_google_genai import ChatGoogleGenerativeAI
+try:
+    from langchain_google_genai import ChatGoogleGenerativeAI
+except ImportError:
+    ChatGoogleGenerativeAI = None
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_chroma import Chroma
 
@@ -144,11 +147,16 @@ class DocPilotEngine:
         }
         chosen_model = model_aliases.get(chosen_model, "models/gemini-3.6-flash")
 
-        return ChatGoogleGenerativeAI(
-            model=chosen_model,
-            google_api_key=self.api_key,
-            max_output_tokens=max_tokens
-        )
+        if ChatGoogleGenerativeAI is not None:
+            return ChatGoogleGenerativeAI(
+                model=chosen_model,
+                google_api_key=self.api_key,
+                max_output_tokens=max_tokens
+            )
+        class SimpleLLM:
+            def __init__(self, m):
+                self.model = m
+        return SimpleLLM(chosen_model)
 
     def _invoke_llm_with_retry(self, llm_or_model: Any, prompt_or_messages: Any, max_tokens: int = 4096, max_retries: int = 3) -> str:
         """Invokes Gemini LLM directly using google-genai SDK for ultra-fast (2-5s) inference."""
