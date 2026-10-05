@@ -134,17 +134,14 @@ class SaveMessageRequest(BaseModel):
 def get_current_selected_doc() -> Optional[str]:
     global selected_document, _engine_instance
     if _engine_instance is None:
-        return "Operating_Systems_Core_Guide.pdf"
+        return selected_document
     docs = engine.get_documents()
     filenames = [d["filename"] for d in docs]
-    if selected_document and selected_document in filenames:
+    if selected_document and (selected_document in filenames or selected_document == "Operating_Systems_Core_Guide.pdf"):
         return selected_document
     if filenames:
         selected_document = filenames[0]
         return selected_document
-    if engine.has_builtin_knowledge():
-        return "Operating_Systems_Core_Guide.pdf"
-    selected_document = None
     return None
 
 @app.get("/")
@@ -170,7 +167,7 @@ def get_status():
             "builtin_title": "Operating Systems Core Guide",
             "builtin_chunks": 8,
             "documents": [],
-            "active_document": "Operating_Systems_Core_Guide.pdf",
+            "active_document": None,
             "total_documents": 0,
             "max_documents": 5,
             "total_chunks": 8
@@ -294,15 +291,67 @@ async def upload_documents(
         "total_chunks": sum(d["chunks"] for d in docs)
     }
 
+@app.get("/api/documents/all")
+def get_all_documents():
+    """Returns all documents across ChromaDB index, Neon PostgreSQL database, and default documents folder."""
+    indexed_docs = {d["filename"]: d for d in engine.get_documents()}
+    
+    # Check Neon PostgreSQL DB
+    db_docs = []
+    db = SessionLocal()
+    try:
+        records = db.query(DocumentRecord).all()
+        for r in records:
+            db_docs.append({
+                "filename": r.filename,
+                "file_size": r.file_size or 0,
+                "chunks": r.chunk_count or (indexed_docs.get(r.filename, {}).get("chunks", 0)),
+                "is_indexed": r.filename in indexed_docs,
+                "source": "database",
+                "created_at": r.created_at.isoformat() if r.created_at else None
+            })
+    except Exception as e:
+        print(f"[DocPilot] Note reading DocumentRecord: {e}")
+    finally:
+        db.close()
+
+    # Check default_docs directory
+    default_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "default_docs")
+    builtin_docs = []
+    if os.path.isdir(default_dir):
+        for f in os.listdir(default_dir):
+            if f.lower().endswith(".pdf"):
+                filepath = os.path.join(default_dir, f)
+                display_name = "Operating_Systems_Core_Guide.pdf" if f.lower() == "operating_systems_core_guide.pdf" else f
+                builtin_docs.append({
+                    "filename": display_name,
+                    "actual_filename": f,
+                    "file_size": os.path.getsize(filepath),
+                    "chunks": indexed_docs.get(display_name, {}).get("chunks", 8 if display_name == "Operating_Systems_Core_Guide.pdf" else 0),
+                    "is_indexed": display_name in indexed_docs or (display_name == "Operating_Systems_Core_Guide.pdf" and engine.has_builtin_knowledge()),
+                    "source": "builtin"
+                })
+
+    return {
+        "active_document": get_current_selected_doc(),
+        "indexed_documents": list(indexed_docs.values()),
+        "db_documents": db_docs,
+        "default_documents": builtin_docs,
+        "max_documents": engine.MAX_DOCUMENTS
+    }
+
 @app.get("/api/document")
 def get_document(filename: Optional[str] = Query(None)):
-    """Serves an uploaded PDF or default OS guide for the split-screen viewer."""
+    """Serves an uploaded PDF, database-stored PDF, or default OS guide for the split-screen viewer."""
     target_filename = filename or get_current_selected_doc()
     if not target_filename:
         raise HTTPException(status_code=404, detail="No active document found.")
 
+    default_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "default_docs")
+
+    # 1. Check for canonical Operating Systems Core Guide
     if target_filename == "Operating_Systems_Core_Guide.pdf":
-        builtin_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "default_docs", "operating_systems_core_guide.pdf")
+        builtin_path = os.path.join(default_dir, "operating_systems_core_guide.pdf")
         if os.path.isfile(builtin_path):
             return FileResponse(
                 path=builtin_path,
@@ -314,7 +363,7 @@ def get_document(filename: Optional[str] = Query(None)):
                 }
             )
 
-    # 1. Fetch directly from Neon PostgreSQL documents table
+    # 2. Fetch directly from Neon PostgreSQL documents table
     db = SessionLocal()
     try:
         doc_rec = db.query(DocumentRecord).filter(DocumentRecord.filename == target_filename).first()
@@ -328,10 +377,12 @@ def get_document(filename: Optional[str] = Query(None)):
                     "Access-Control-Expose-Headers": "Content-Disposition"
                 }
             )
+    except Exception as e:
+        print(f"[DocPilot] Note querying DocumentRecord for {target_filename}: {e}")
     finally:
         db.close()
 
-    # Fallback to local cached file if present
+    # 3. Check local cached file in UPLOAD_DIR
     file_path = os.path.join(UPLOAD_DIR, target_filename)
     if os.path.isfile(file_path):
         return FileResponse(
@@ -344,16 +395,88 @@ def get_document(filename: Optional[str] = Query(None)):
             }
         )
 
+    # 4. Check default_docs directory directly
+    candidate_default_path = os.path.join(default_dir, target_filename)
+    if os.path.isfile(candidate_default_path):
+        return FileResponse(
+            path=candidate_default_path,
+            media_type="application/pdf",
+            filename=target_filename,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Expose-Headers": "Content-Disposition"
+            }
+        )
+
+    # 5. Case-insensitive or normalized check in default_docs
+    if os.path.isdir(default_dir):
+        for f in os.listdir(default_dir):
+            if f.lower() == target_filename.lower() or f.lower().replace(" ", "_") == target_filename.lower().replace(" ", "_"):
+                return FileResponse(
+                    path=os.path.join(default_dir, f),
+                    media_type="application/pdf",
+                    filename=f,
+                    headers={
+                        "Access-Control-Allow-Origin": "*",
+                        "Access-Control-Expose-Headers": "Content-Disposition"
+                    }
+                )
+
     raise HTTPException(status_code=404, detail=f"Document '{target_filename}' not found.")
 
 @app.post("/api/document/select")
 def select_active_document(payload: SelectDocRequest):
     global selected_document
     docs = {d["filename"] for d in engine.get_documents()}
-    if payload.filename != "Operating_Systems_Core_Guide.pdf" and payload.filename not in docs:
-        raise HTTPException(status_code=404, detail=f"Document '{payload.filename}' not found in loaded documents.")
-    selected_document = payload.filename
-    return {"message": f"Active preview set to {selected_document}", "active_document": selected_document}
+    default_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "default_docs")
+    target_name = payload.filename
+
+    # If it's already indexed or the canonical guide, set active
+    if target_name in docs or target_name == "Operating_Systems_Core_Guide.pdf":
+        selected_document = target_name
+        return {"message": f"Active preview set to {selected_document}", "active_document": selected_document}
+
+    # Check Neon PostgreSQL DB
+    db = SessionLocal()
+    found_in_db = False
+    doc_rec = None
+    try:
+        doc_rec = db.query(DocumentRecord).filter(DocumentRecord.filename == target_name).first()
+        if doc_rec and doc_rec.file_data:
+            found_in_db = True
+            cached_path = os.path.join(UPLOAD_DIR, target_name)
+            if not os.path.exists(cached_path) or os.path.getsize(cached_path) == 0:
+                with open(cached_path, "wb") as f:
+                    f.write(doc_rec.file_data)
+            # Index into engine if not already present
+            if target_name not in engine.doc_registry:
+                try:
+                    engine.add_pdf(cached_path, filename=target_name)
+                except Exception as idx_err:
+                    print(f"[DocPilot] Note indexing DB doc on select: {idx_err}")
+    except Exception as e:
+        print(f"[DocPilot] Note querying DB for select: {e}")
+    finally:
+        db.close()
+
+    if found_in_db:
+        selected_document = target_name
+        return {"message": f"Active preview set to {selected_document}", "active_document": selected_document}
+
+    # Check default_docs directory
+    default_file_path = os.path.join(default_dir, target_name)
+    if not os.path.isfile(default_file_path) and os.path.isdir(default_dir):
+        for f in os.listdir(default_dir):
+            if f.lower() == target_name.lower():
+                target_name = f
+                default_file_path = os.path.join(default_dir, f)
+                break
+
+    if os.path.isfile(default_file_path):
+        selected_document = target_name
+        return {"message": f"Active preview set to {selected_document}", "active_document": selected_document}
+
+    raise HTTPException(status_code=404, detail=f"Document '{payload.filename}' not found.")
 
 @app.delete("/api/document/{filename}")
 def delete_document(filename: str):
