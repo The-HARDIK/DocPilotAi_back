@@ -1,7 +1,7 @@
 import os
 import shutil
 import json
-from typing import List, Optional
+from typing import List, Optional, Union, Any
 from fastapi import FastAPI, UploadFile, File, Form, Query, HTTPException, Depends, status, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -112,7 +112,7 @@ class ChatMessage(BaseModel):
 class QueryRequest(BaseModel):
     question: str
     chat_history: Optional[List[ChatMessage]] = []
-    conversation_id: Optional[int] = None
+    conversation_id: Optional[Union[int, str]] = None
 
 class SelectDocRequest(BaseModel):
     filename: str
@@ -620,9 +620,11 @@ def create_chat(payload: CreateConversationRequest):
     return {"id": chat_id, "title": chat_title, "documents": docs_to_record or []}
 
 @app.delete("/api/chats/{conversation_id}")
-def delete_chat(conversation_id: int):
+def delete_chat(conversation_id: str):
+    if not str(conversation_id).isdigit():
+        return {"status": "success", "message": "Guest session cleared"}
     db = SessionLocal()
-    chat = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+    chat = db.query(Conversation).filter(Conversation.id == int(conversation_id)).first()
     if not chat:
         db.close()
         raise HTTPException(status_code=404, detail="Conversation not found")
@@ -632,15 +634,22 @@ def delete_chat(conversation_id: int):
     return {"status": "success", "message": "Conversation deleted"}
 
 @app.get("/api/chats/messages/{conversation_id}")
-def get_chat_messages(conversation_id: int):
+def get_chat_messages(conversation_id: str):
+    if not str(conversation_id).isdigit():
+        return {
+            "conversation_id": conversation_id,
+            "title": "Guest Session",
+            "documents": [],
+            "messages": []
+        }
     db = SessionLocal()
-    chat = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+    chat = db.query(Conversation).filter(Conversation.id == int(conversation_id)).first()
     if not chat:
         db.close()
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     conv_docs = json.loads(chat.documents) if chat.documents else []
-    msgs = db.query(Message).filter(Message.conversation_id == conversation_id).order_by(Message.timestamp.asc()).all()
+    msgs = db.query(Message).filter(Message.conversation_id == int(conversation_id)).order_by(Message.timestamp.asc()).all()
     result = [
         {
             "role": m.role,
@@ -651,18 +660,25 @@ def get_chat_messages(conversation_id: int):
     ]
     db.close()
     return {
-        "conversation_id": conversation_id,
+        "conversation_id": int(conversation_id),
         "title": chat.title,
         "documents": conv_docs,
         "messages": result
     }
 
 @app.post("/api/chats/{conversation_id}/restore")
-def restore_chat_documents(conversation_id: int):
+def restore_chat_documents(conversation_id: str):
     """Aligns active vector database with documents associated with this conversation."""
     global selected_document
+    if not str(conversation_id).isdigit():
+        return {
+            "status": "guest_session",
+            "restored": False,
+            "documents": engine.get_documents(),
+            "active_document": get_current_selected_doc()
+        }
     db = SessionLocal()
-    chat = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+    chat = db.query(Conversation).filter(Conversation.id == int(conversation_id)).first()
     if not chat:
         db.close()
         raise HTTPException(status_code=404, detail="Conversation not found")
@@ -747,23 +763,24 @@ async def chat_query(payload: QueryRequest):
     history_dict = [{"role": msg.role, "content": msg.content} for msg in payload.chat_history]
     result = engine.query(question=payload.question, chat_history=history_dict)
 
-    # Automatically persist turn if associated with an active conversation
-    if payload.conversation_id:
+    # Automatically persist turn if associated with an active conversation (numeric ID)
+    if payload.conversation_id and str(payload.conversation_id).isdigit():
         try:
+            conv_id = int(payload.conversation_id)
             db = SessionLocal()
-            chat = db.query(Conversation).filter(Conversation.id == payload.conversation_id).first()
+            chat = db.query(Conversation).filter(Conversation.id == conv_id).first()
             if chat and not chat.documents:
                 # Snapshot active document names into the conversation
                 current_doc_names = [d["filename"] for d in docs] if docs else ["Operating_Systems_Core_Guide.pdf"]
                 chat.documents = json.dumps(current_doc_names)
 
             user_msg = Message(
-                conversation_id=payload.conversation_id,
+                conversation_id=conv_id,
                 role="user",
                 content=payload.question
             )
             asst_msg = Message(
-                conversation_id=payload.conversation_id,
+                conversation_id=conv_id,
                 role="assistant",
                 content=result["answer"],
                 sources=json.dumps(result.get("sources", [])) if result.get("sources") else None
