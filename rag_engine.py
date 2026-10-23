@@ -387,18 +387,23 @@ class DocPilotEngine:
 
         # Skip extra LLM latency if the question is already detailed and self-contained
         words = question.lower().split()
-        ambiguous_triggers = {"it", "this", "that", "these", "those", "why", "how", "more", "again", "explain", "what about"}
-        is_short_or_ambiguous = len(words) < 6 or any(w.strip("?,.!") in ambiguous_triggers for w in words[:3])
+        ambiguous_triggers = {
+            "it", "this", "that", "these", "those", "why", "how", "more", "again", 
+            "explain", "what about", "option", "choice", "a", "b", "c", "d", 
+            "a)", "b)", "c)", "d)", "answer", "yes", "no", "why?"
+        }
+        is_short_or_ambiguous = len(words) < 8 or any(w.strip("?,.!") in ambiguous_triggers for w in words[:3])
         if not is_short_or_ambiguous:
             return question
 
         history_summary = "\n".join([f"{msg['role']}: {msg['content']}" for msg in chat_history[-4:]])
         
         rephrase_prompt = (
-            "Given the chat history and the latest user question, rephrase the question to be a self-contained "
-            "search query that captures full context. Do NOT answer the question, only return the rephrased query.\n\n"
+            "Given the chat history and the latest user response (which may be an answer to an interactive quiz or MCQ like 'Option A' or 'B'), "
+            "rephrase the user's input into a self-contained search query that captures the Operating Systems topic being discussed. "
+            "Do NOT answer the question, only return the rephrased query.\n\n"
             f"Chat History:\n{history_summary}\n\n"
-            f"Latest Question: {question}\n"
+            f"Latest Response: {question}\n"
             "Standalone Query:"
         )
 
@@ -424,18 +429,38 @@ class DocPilotEngine:
         collection_count = self.vector_store._collection.count()
 
         # If no documents exist in vector store, provide direct AI answer
+        teacher_system_prompt = (
+            "You are DocPilot, a warm, patient, and highly interactive master teacher specializing in Operating Systems.\n\n"
+            "YOUR PEDAGOGICAL APPROACH (TEACH LIKE THE USER IS A COMPLETE BEGINNER):\n"
+            "1. TREAT THE USER AS A BLANK SLATE: Assume the student has ZERO prior knowledge. "
+            "Do NOT jump directly into dense academic jargon or intimidating walls of text. Explain from first principles "
+            "like a caring, supportive tutor guiding a curious beginner for the very first time.\n"
+            "2. START WITH A VIVID EVERYDAY ANALOGY: Anchor every concept in an intuitive real-world analogy first "
+            "(e.g., CPU scheduling like a doctor's clinic queue, semaphores like a restroom lock/key, deadlock like a 4-way traffic gridlock where nobody yields, "
+            "virtual memory/paging like keeping current study books on a small desk while storing the rest in a library shelf).\n"
+            "3. KEEP IT CONCISE, CRISP & TO-THE-POINT: Long responses are NOT wanted! Keep your core explanation brief, punchy, "
+            "and friendly (around 120-180 words, 2-3 short paragraphs max). Avoid dense monolithic walls of text.\n"
+            "4. WARM & ENCOURAGING TONE: Be enthusiastic, friendly, and supportive ('Let's break this down simply! 😊', 'Think of it this way:').\n"
+            "5. IF THE STUDENT IS ANSWERING A PREVIOUS QUICK-CHECK OR MCQ (e.g. Option A/B/C):\n"
+            "   - Immediately celebrate if they got it right ('🎉 Spot on! Exactly right!' or 'Bingo!') and explain why in 1 sentence.\n"
+            "   - If they picked the wrong option, be encouraging ('Good try! Not quite, but here is why...') and gently guide them to the right concept.\n"
+            "6. CITATIONS: When using document context, cite [Document: <filename>, Page: <page_no>].\n"
+            "7. FORMATTING: Present tables with Markdown pipes (| Col | Col |), and Gantt charts or state flows in fenced ```text ``` blocks.\n\n"
+            "8. MANDATORY INTERACTIVE QUICK-CHECK (END OF EVERY EXPLANATION):\n"
+            "At the very end of your explanation, you MUST ALWAYS include a fun, interactive 3-choice mini-quiz (MCQ) testing what was just taught. "
+            "Format it cleanly like this so the interactive interface can render it as clickable buttons:\n\n"
+            "---\n"
+            "### 🎯 Teacher's Quick Check:\n"
+            "*<Short, direct question testing the concept just taught>* \n\n"
+            "- **A)** <Option A>\n"
+            "- **B)** <Option B>\n"
+            "- **C)** <Option C>\n\n"
+            "👉 *Tap an option above or type your answer to continue!*"
+        )
+
         if collection_count == 0:
             direct_messages = [
-                SystemMessage(
-                    content=(
-                        "You are DocPilot AI, an expert academic tutor and technical assistant specializing in Operating Systems and computer science.\n"
-                        "Formatting Rules:\n"
-                        "1. Explain the concepts thoroughly, clearly, and step-by-step.\n"
-                        "2. TABLES: Format comparison matrices, process tables, and registers strictly as Markdown tables with header pipes.\n"
-                        "3. GANTT CHARTS & DIAGRAMS: Wrap execution flows, ASCII timelines, or queues in fenced code blocks (```text ... ```).\n"
-                        "4. MATH & FORMULAS: Present calculations step-by-step with clean arithmetic.\n"
-                    )
-                )
+                SystemMessage(content=teacher_system_prompt)
             ]
             if chat_history:
                 for turn in chat_history[-4:]:
@@ -483,19 +508,7 @@ class DocPilotEngine:
         joined_context = "\n\n".join(formatted_context_list)
 
         messages = [
-            SystemMessage(
-                content=(
-                    "You are DocPilot AI, an expert academic tutor and technical assistant specializing in Operating Systems and computer science.\n"
-                    "Formatting Rules:\n"
-                    "1. Explain the concepts thoroughly, clearly, and step-by-step using the provided context whenever relevant.\n"
-                    "2. CITATIONS: When citing information from the context, cite specific Document names and Page numbers (e.g. [Operating_Systems_Core_Guide.pdf, Page X] or [UploadedDoc.pdf, Page X]).\n"
-                    "3. GENERAL & TECHNICAL QUESTIONS: If the question asks for explanations, comparisons, algorithms, or examples that go beyond the excerpted chunks, leverage your full academic technical expertise to provide a complete, rigorous, and accurate answer rather than refusing.\n"
-                    "4. TABLES: Whenever presenting structured data, process tables, comparison matrices, or registers, ALWAYS format them strictly as standard GitHub-flavored Markdown tables with header pipes (e.g. | Algorithm | Preemptive | Waiting Time |). NEVER output raw tabs or whitespace-separated columns.\n"
-                    "5. GANTT CHARTS & DIAGRAMS: Whenever illustrating Gantt charts, ASCII timelines, execution flows, or queue states (e.g. +---+---+ or [P1, P2]), ALWAYS wrap them inside fenced code blocks (```text ... ```) so spaces, alignment, and monospace formatting are preserved.\n"
-                    "6. MATH & FORMULAS: Present calculations cleanly with arithmetic steps.\n"
-                    "7. MULTI-DOC: When information comes from different loaded documents, synthesize or contrast them clearly."
-                )
-            )
+            SystemMessage(content=teacher_system_prompt)
         ]
 
         if chat_history:
@@ -506,7 +519,7 @@ class DocPilotEngine:
                     messages.append(AIMessage(content=turn.get("content", "")))
 
         messages.append(
-            HumanMessage(content=f"Context:\n{joined_context}\n\nQuestion: {cleaned_question}")
+            HumanMessage(content=f"Context from course documents:\n{joined_context}\n\nStudent Question: {cleaned_question}")
         )
 
         try:
